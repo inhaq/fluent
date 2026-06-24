@@ -1060,6 +1060,9 @@ final class AppState: ObservableObject, @unchecked Sendable {
         return trimmed.isEmpty ? apiKey : trimmed
     }
 
+    /// Builds a ``TranscriptionService`` configured with the resolved
+    /// transcription credentials, model, language, and a vocabulary biasing
+    /// prompt derived from the user's custom vocabulary.
     func makeTranscriptionService() throws -> TranscriptionService {
         try TranscriptionService(
             apiKey: resolvedTranscriptionAPIKey,

@@ -19,6 +19,15 @@ class TranscriptionService {
         return override > 0 ? override : 20
     }
 
+    /// Creates a transcription client for an OpenAI-compatible
+    /// `audio/transcriptions` endpoint.
+    /// - Parameters:
+    ///   - apiKey: Bearer token for the provider.
+    ///   - baseURL: Provider base URL; normalized and validated.
+    ///   - transcriptionModel: Whisper model id (defaults to `whisper-large-v3`).
+    ///   - language: Optional ISO language hint; `nil` lets Whisper auto-detect.
+    ///   - prompt: Optional biasing prompt (e.g. custom vocabulary) trimmed and
+    ///     capped to ~800 characters to stay within Whisper's context window.
     init(
         apiKey: String,
         baseURL: String = "https://api.groq.com/openai/v1",
@@ -43,6 +52,8 @@ class TranscriptionService {
     }
 
     // Validate API key by hitting a lightweight endpoint
+    /// Validates an API key by issuing a lightweight authenticated request to
+    /// the provider's `models` endpoint. Returns `true` only on HTTP 200.
     static func validateAPIKey(_ key: String, baseURL: String = "https://api.groq.com/openai/v1") async -> Bool {
         let trimmed = key.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return false }
@@ -61,7 +72,9 @@ class TranscriptionService {
         }
     }
 
-    // Upload audio file, submit for transcription, poll until done, return text
+    /// Uploads the recorded audio file for transcription and returns the
+    /// transcribed text, racing the request against a configurable timeout and
+    /// honoring cancellation.
     func transcribe(fileURL: URL) async throws -> String {
         guard !Task.isCancelled else {
             throw CancellationError()
@@ -106,11 +119,13 @@ class TranscriptionService {
         }
     }
 
-    // Send audio file for transcription and return text
+    /// Performs the underlying transcription request for the given audio file.
     private func transcribeAudio(fileURL: URL) async throws -> String {
         return try await transcribeAudioWithURLSession(fileURL: fileURL)
     }
 
+    /// Issues the multipart upload to the provider's `audio/transcriptions`
+    /// endpoint via `URLSession` and returns the validated transcript.
     private func transcribeAudioWithURLSession(fileURL: URL) async throws -> String {
         let url = baseURL
             .appendingPathComponent("audio")
@@ -152,6 +167,9 @@ class TranscriptionService {
         }
     }
 
+    /// Validates the HTTP response from a transcription upload, mapping
+    /// non-200 statuses to user-readable errors, and parses the transcript on
+    /// success.
     private func validateTranscriptionResponse(data: Data, response: URLResponse, fileURL: URL) throws -> String {
         guard let httpResponse = response as? HTTPURLResponse else {
             throw TranscriptionError.submissionFailed("No response from server")
@@ -176,6 +194,8 @@ class TranscriptionService {
 
         return try parseTranscript(from: data)
     }
+    /// Returns the MIME content type for a given audio file name based on its
+    /// extension, defaulting to `audio/mp4`.
     private func audioContentType(for fileName: String) -> String {
         if fileName.lowercased().hasSuffix(".wav") {
             return "audio/wav"
@@ -189,11 +209,17 @@ class TranscriptionService {
         return "audio/mp4"
     }
 
+    /// Returns the size of the file at `fileURL` in bytes, or `-1` if it cannot
+    /// be determined.
     private func fileSizeBytes(for fileURL: URL) -> Int64 {
         let attributes = try? FileManager.default.attributesOfItem(atPath: fileURL.path)
         return (attributes?[.size] as? NSNumber)?.int64Value ?? -1
     }
 
+    /// Builds the `multipart/form-data` body for a Whisper transcription
+    /// request, including the model, response format, deterministic
+    /// `temperature=0`, optional language hint, optional biasing prompt, and
+    /// the audio file payload.
     private func makeMultipartBody(
         audioData: Data,
         fileName: String,
@@ -344,6 +370,9 @@ class TranscriptionService {
 
     private let hallucinationNoSpeechThreshold = 0.8
 
+    /// Parses the transcript text from a provider response. JSON responses are
+    /// decoded and run through the hallucination filter; plain-text responses
+    /// are normalized into a single trimmed string.
     private func parseTranscript(from data: Data) throws -> String {
         if let json = try JSONSerialization.jsonObject(with: data) as? [String: Any],
            let text = json["text"] as? String {
@@ -365,6 +394,11 @@ class TranscriptionService {
         return text
     }
 
+    /// Determines whether a transcript is a Whisper silence/noise
+    /// hallucination. Returns `true` only when the text matches a known
+    /// hallucinated phrase and the minimum `no_speech_prob` across all segments
+    /// meets ``hallucinationNoSpeechThreshold`` (i.e. Whisper is highly
+    /// confident the clip contains no speech).
     private func isHallucination(text: String, json: [String: Any]) -> Bool {
         let normalized = text
             .lowercased()
