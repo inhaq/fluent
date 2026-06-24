@@ -21,6 +21,17 @@ private struct MenuWindowResolver: NSViewRepresentable {
     }
 }
 
+/// Reports the natural (fitting) height of the menu panel content so the
+/// `.window`-style `MenuBarExtra` can be given a concrete height. A bare
+/// `ScrollView` has no intrinsic height in its scroll axis, which otherwise
+/// collapses the panel window to a 1–2px sliver.
+private struct MenuContentHeightKey: PreferenceKey {
+    static var defaultValue: CGFloat = 0
+    static func reduce(value: inout CGFloat, nextValue: () -> CGFloat) {
+        value = max(value, nextValue())
+    }
+}
+
 /// A full-width tappable panel row with a hover highlight, used to mimic native
 /// menu items inside the `.window`-style panel.
 private struct PanelRow<Label: View>: View {
@@ -60,6 +71,12 @@ struct MenuBarView: View {
     @EnvironmentObject var appState: AppState
     @ObservedObject private var updateManager = UpdateManager.shared
     @State private var hostWindow: NSWindow?
+    /// Measured natural height of the panel content. Defaults to the max so the
+    /// panel opens at full height and shrinks to fit, never collapsing to 0.
+    @State private var contentHeight: CGFloat = MenuBarView.maxPanelHeight
+
+    private static let panelWidth: CGFloat = 300
+    private static let maxPanelHeight: CGFloat = 620
 
     private var appVersion: String {
         Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "1.0"
@@ -334,9 +351,18 @@ struct MenuBarView: View {
                 }
             }
             .padding(8)
+            .background(
+                GeometryReader { proxy in
+                    Color.clear
+                        .preference(key: MenuContentHeightKey.self, value: proxy.size.height)
+                }
+            )
         }
-        .frame(width: 300)
-        .frame(maxHeight: 620)
+        .frame(width: Self.panelWidth)
+        .frame(height: min(contentHeight, Self.maxPanelHeight))
+        .onPreferenceChange(MenuContentHeightKey.self) { newHeight in
+            if newHeight > 0 { contentHeight = newHeight }
+        }
         .background(MenuWindowResolver { hostWindow = $0 })
     }
 
