@@ -21,14 +21,9 @@ private struct SettingsCard<Content: View>: View {
                 .font(.headline)
             content
         }
-        .padding(16)
+        .padding(18)
         .frame(maxWidth: .infinity, alignment: .leading)
-        .background(Color(nsColor: .controlBackgroundColor).opacity(0.5))
-        .cornerRadius(10)
-        .overlay(
-            RoundedRectangle(cornerRadius: 10)
-                .stroke(Color.primary.opacity(0.06), lineWidth: 1)
-        )
+        .liquidSurface(cornerRadius: 14)
     }
 }
 
@@ -372,12 +367,7 @@ struct SettingsView: View {
                         appState.selectedSettingsTab = tab
                     } label: {
                         SettingsSidebarRow(title: tab.title, icon: tab.icon)
-                            .background(
-                                RoundedRectangle(cornerRadius: 6)
-                                    .fill(appState.selectedSettingsTab == tab
-                                          ? Color.accentColor.opacity(0.15)
-                                          : Color.clear)
-                            )
+                            .liquidSelection(isSelected: appState.selectedSettingsTab == tab)
                     }
                     .buttonStyle(.plain)
                 }
@@ -385,8 +375,8 @@ struct SettingsView: View {
                 Spacer()
             }
             .padding(10)
-            .frame(width: 180)
-            .background(Color(nsColor: .windowBackgroundColor))
+            .frame(width: 184)
+            .background(.regularMaterial)
 
             Divider()
 
