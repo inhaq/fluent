@@ -392,14 +392,15 @@ class TranscriptionService {
     /// segments we apply the Whisper paper's robust-decoding heuristics to drop
     /// hallucinated/non-speech segments; otherwise we fall back to the raw text.
     private func parseTranscript(from data: Data) throws -> String {
-        if let json = try JSONSerialization.jsonObject(with: data) as? [String: Any],
-           let text = json["text"] as? String {
+        if let json = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any] {
             if let segments = json["segments"] as? [[String: Any]], !segments.isEmpty {
                 return filteredTranscript(fromSegments: segments)
             }
-            // No per-segment metadata available: return the text unfiltered
-            // rather than risk dropping real speech with a blunt phrase match.
-            return text.trimmingCharacters(in: .whitespacesAndNewlines)
+            if let text = json["text"] as? String {
+                // No per-segment metadata available: return the text unfiltered
+                // rather than risk dropping real speech with a blunt phrase match.
+                return text.trimmingCharacters(in: .whitespacesAndNewlines)
+            }
         }
 
         let plainText = String(data: data, encoding: .utf8) ?? ""
@@ -428,9 +429,13 @@ class TranscriptionService {
         }
 
         let kept = segments.filter { !isHallucinatedSegment($0) }
-        // Whisper segment text carries its own leading spacing, so a plain join
-        // reproduces normal word spacing.
-        let rebuilt = kept.map(\.text).joined()
+        // Whisper doesn't guarantee each segment's text carries its own leading
+        // space, so trim each one and join with a single space to avoid merging
+        // words across segment boundaries (and to collapse incidental padding).
+        let rebuilt = kept
+            .map { $0.text.trimmingCharacters(in: .whitespacesAndNewlines) }
+            .filter { !$0.isEmpty }
+            .joined(separator: " ")
         return rebuilt.trimmingCharacters(in: .whitespacesAndNewlines)
     }
 

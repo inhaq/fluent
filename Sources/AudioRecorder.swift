@@ -857,13 +857,18 @@ final class AudioRecorder: NSObject, ObservableObject, AVCaptureAudioDataOutputS
             let rms = sqrt(summedMeanSquare / Float(channelCount))
             guard rms > 0, peak > 0 else { return nil }
 
-            // Target the desired RMS, but never amplify beyond the cap, never
-            // let the loudest sample exceed the ceiling, and never attenuate.
-            var gain = min(targetRMS / rms, maxMakeupGain)
-            if peak * gain > peakCeiling {
-                gain = peakCeiling / peak
+            // Target the desired RMS, but never amplify beyond the cap and
+            // never let the loudest sample exceed the ceiling. If the
+            // high-passed signal already overshoots the ceiling, bail out so
+            // the caller uploads the untouched original rather than a clipped
+            // version.
+            let peakLimitedGain = peakCeiling / peak
+            guard peakLimitedGain >= 1 else {
+                return nil
             }
-            gain = max(gain, 1)
+            // Never attenuate (floor at 1), and keep the peak under the ceiling.
+            let desiredGain = max(targetRMS / rms, 1)
+            let gain = min(desiredGain, maxMakeupGain, peakLimitedGain)
 
             if gain != 1 {
                 for channel in 0..<channelCount {
