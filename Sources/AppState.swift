@@ -205,6 +205,7 @@ final class AppState: ObservableObject, @unchecked Sendable {
     private let transcriptionAPIKeyStorageKey = "transcription_api_key"
     private let postProcessingModelStorageKey = "post_processing_model"
     private let postProcessingFallbackModelStorageKey = "post_processing_fallback_model"
+    private let postProcessingReasoningEffortStorageKey = "post_processing_reasoning_effort"
     private let contextModelStorageKey = "context_model"
     private let holdShortcutStorageKey = "hold_shortcut"
     private let toggleShortcutStorageKey = "toggle_shortcut"
@@ -277,6 +278,27 @@ final class AppState: ObservableObject, @unchecked Sendable {
     static let defaultPostProcessingModel = "openai/gpt-oss-20b"
     static let defaultPostProcessingFallbackModel = "meta-llama/llama-4-scout-17b-16e-instruct"
     static let defaultContextModel = "meta-llama/llama-4-scout-17b-16e-instruct"
+    static let defaultPostProcessingReasoningEffort = "auto"
+    // User-selectable reasoning depth for post-processing. "auto" leaves the
+    // request untouched (per-model defaults apply); the others send
+    // `reasoning_effort`. "none" disables thinking entirely on providers that
+    // support it (e.g. Groq Qwen3 / gpt-oss), which is faster and uses fewer
+    // tokens. Graded levels (low/medium/high) are honored by models that
+    // support them (e.g. gpt-oss); models that only toggle reasoning treat any
+    // non-"none" value as on.
+    static let postProcessingReasoningEffortOptions: [(value: String, label: String)] = [
+        ("auto", "Automatic (model default)"),
+        ("none", "Off — no reasoning (fastest, fewest tokens)"),
+        ("low", "Low"),
+        ("medium", "Medium"),
+        ("high", "High")
+    ]
+
+    static func normalizedPostProcessingReasoningEffort(_ value: String) -> String {
+        postProcessingReasoningEffortOptions.contains { $0.value == value }
+            ? value
+            : defaultPostProcessingReasoningEffort
+    }
     private static let trailingPressEnterCommandPattern = try! NSRegularExpression(
         pattern: #"(?i)(?:^|[ \t\r\n,;:\-]+)press[ \t\r\n]+enter[\s\p{P}]*$"#
     )
@@ -329,6 +351,24 @@ final class AppState: ObservableObject, @unchecked Sendable {
         didSet {
             UserDefaults.standard.set(postProcessingFallbackModel, forKey: postProcessingFallbackModelStorageKey)
         }
+    }
+
+    @Published var postProcessingReasoningEffort: String {
+        didSet {
+            let normalized = Self.normalizedPostProcessingReasoningEffort(postProcessingReasoningEffort)
+            if normalized != postProcessingReasoningEffort {
+                postProcessingReasoningEffort = normalized
+                return
+            }
+            UserDefaults.standard.set(postProcessingReasoningEffort, forKey: postProcessingReasoningEffortStorageKey)
+        }
+    }
+
+    /// The `reasoning_effort` value to send for post-processing, or `nil` when
+    /// the user left it on "Automatic" (so per-model defaults apply and no
+    /// override is sent — keeps custom/non-Groq providers working).
+    var postProcessingReasoningEffortOverride: String? {
+        postProcessingReasoningEffort == "auto" ? nil : postProcessingReasoningEffort
     }
 
     @Published var contextModel: String {
@@ -598,6 +638,10 @@ final class AppState: ObservableObject, @unchecked Sendable {
     private var audioDeviceObservers: [NSObjectProtocol] = []
     private var needsMicrophoneRefreshAfterRecording = false
     private let pipelineHistoryStore = PipelineHistoryStore()
+    /// Bumped by every local mutation of `pipelineHistory`. Lets the initial
+    /// async load detect that it raced a mutation and avoid clobbering newer
+    /// in-memory state.
+    private var pipelineHistoryMutationGeneration = 0
     private let shortcutSessionController = DictationShortcutSessionController()
     private var activeRecordingTriggerMode: RecordingTriggerMode?
     private var currentSessionIntent: SessionIntent = .dictation
@@ -627,6 +671,9 @@ final class AppState: ObservableObject, @unchecked Sendable {
         let transcriptionAPIKey = Self.loadStoredAPIKey(account: transcriptionAPIKeyStorageKey)
         let postProcessingModel = UserDefaults.standard.string(forKey: postProcessingModelStorageKey) ?? Self.defaultPostProcessingModel
         let postProcessingFallbackModel = UserDefaults.standard.string(forKey: postProcessingFallbackModelStorageKey) ?? Self.defaultPostProcessingFallbackModel
+        let postProcessingReasoningEffort = Self.normalizedPostProcessingReasoningEffort(
+            UserDefaults.standard.string(forKey: postProcessingReasoningEffortStorageKey) ?? Self.defaultPostProcessingReasoningEffort
+        )
         let contextModel = UserDefaults.standard.string(forKey: contextModelStorageKey) ?? Self.defaultContextModel
         let shortcuts = Self.loadShortcutConfiguration(
             holdKey: holdShortcutStorageKey,
@@ -710,7 +757,9 @@ final class AppState: ObservableObject, @unchecked Sendable {
         for audioFileName in removedAudioFileNames {
             Self.deleteAudioFile(audioFileName)
         }
-        let savedHistory = pipelineHistoryStore.loadAllHistory()
+        // History (which can include several MB of base64 screenshot payloads)
+        // is loaded asynchronously after init to keep it off the launch
+        // critical path. See loadPipelineHistoryAsync() below.
 
         let selectedMicrophoneID = UserDefaults.standard.string(forKey: selectedMicrophoneStorageKey) ?? "default"
 
@@ -729,6 +778,7 @@ final class AppState: ObservableObject, @unchecked Sendable {
         self.transcriptionModel = transcriptionModel
         self.postProcessingModel = postProcessingModel
         self.postProcessingFallbackModel = postProcessingFallbackModel
+        self.postProcessingReasoningEffort = postProcessingReasoningEffort
         self.contextModel = contextModel
         self.holdShortcut = shortcuts.hold
         self.toggleShortcut = shortcuts.toggle
@@ -758,14 +808,14 @@ final class AppState: ObservableObject, @unchecked Sendable {
         self.alertSoundsEnabled = alertSoundsEnabled
         self.soundVolume = soundVolume
         self.voiceMacros = initialMacros
-        self.pipelineHistory = savedHistory
+        self.pipelineHistory = []
         self.hasAccessibility = initialAccessibility
         self.hasScreenRecordingPermission = initialScreenCapturePermission
         self.launchAtLogin = SMAppService.mainApp.status == .enabled
         self.selectedMicrophoneID = selectedMicrophoneID
         self.precomputeMacros()
 
-        refreshAvailableMicrophones()
+        refreshAvailableMicrophonesAsync()
         installAudioDeviceObservers()
 
         if shortcuts.didUpdateHoldStoredValue {
@@ -800,6 +850,26 @@ final class AppState: ObservableObject, @unchecked Sendable {
 
         // Clear any stale recording flag left over from an unclean exit.
         AppState.writeRecordingStateFlag(false)
+
+        loadPipelineHistoryAsync()
+    }
+
+    /// Loads persisted pipeline history off the main thread and publishes it
+    /// once available. Keeps the (potentially multi-MB) base64 screenshot
+    /// payloads from blocking app launch.
+    private func loadPipelineHistoryAsync() {
+        let generation = pipelineHistoryMutationGeneration
+        pipelineHistoryStore.loadAllHistoryAsync { [weak self] items in
+            guard let self else { return }
+            if self.pipelineHistoryMutationGeneration == generation {
+                self.pipelineHistory = items
+            } else {
+                // A local mutation (record/retry/delete/clear) raced the initial
+                // load. Re-fetch the latest persisted state instead of
+                // overwriting the newer in-memory entries with a stale snapshot.
+                self.loadPipelineHistoryAsync()
+            }
+        }
     }
 
     deinit {
@@ -1105,6 +1175,7 @@ final class AppState: ObservableObject, @unchecked Sendable {
             for audioFileName in removedAudioFileNames {
                 Self.deleteAudioFile(audioFileName)
             }
+            pipelineHistoryMutationGeneration += 1
             pipelineHistory = []
         } catch {
             errorMessage = "Unable to clear run history: \(error.localizedDescription)"
@@ -1117,6 +1188,7 @@ final class AppState: ObservableObject, @unchecked Sendable {
             if let audioFileName = try pipelineHistoryStore.delete(id: id) {
                 Self.deleteAudioFile(audioFileName)
             }
+            pipelineHistoryMutationGeneration += 1
             pipelineHistory.remove(at: index)
         } catch {
             errorMessage = "Unable to delete run history entry: \(error.localizedDescription)"
@@ -1154,7 +1226,8 @@ final class AppState: ObservableObject, @unchecked Sendable {
             baseURL: apiBaseURL,
             preferredModel: postProcessingModel,
             preferredFallbackModel: postProcessingFallbackModel,
-            instructionExecutionGuardEnabled: instructionExecutionGuardEnabled
+            instructionExecutionGuardEnabled: instructionExecutionGuardEnabled,
+            reasoningEffortOverride: postProcessingReasoningEffortOverride
         )
         let capturedCustomVocabulary = customVocabulary
         let capturedCustomSystemPrompt = customSystemPrompt
@@ -1218,7 +1291,10 @@ final class AppState: ObservableObject, @unchecked Sendable {
                     )
                     do {
                         try pipelineHistoryStore.update(updatedItem)
-                        pipelineHistory = pipelineHistoryStore.loadAllHistory()
+                        pipelineHistoryMutationGeneration += 1
+                        if let idx = pipelineHistory.firstIndex(where: { $0.id == updatedItem.id }) {
+                            pipelineHistory[idx] = updatedItem
+                        }
                         let trimmedRetryTranscript = finalTranscript.trimmingCharacters(in: .whitespacesAndNewlines)
                         if !trimmedRetryTranscript.isEmpty {
                             lastTranscript = trimmedRetryTranscript
@@ -1257,7 +1333,10 @@ final class AppState: ObservableObject, @unchecked Sendable {
                     )
                     do {
                         try pipelineHistoryStore.update(updatedItem)
-                        pipelineHistory = pipelineHistoryStore.loadAllHistory()
+                        pipelineHistoryMutationGeneration += 1
+                        if let idx = pipelineHistory.firstIndex(where: { $0.id == updatedItem.id }) {
+                            pipelineHistory[idx] = updatedItem
+                        }
                     } catch {}
                     retryingItemIDs.remove(item.id)
                 }
@@ -1395,6 +1474,34 @@ final class AppState: ObservableObject, @unchecked Sendable {
 
         needsMicrophoneRefreshAfterRecording = false
         availableMicrophones = AudioDevice.availableInputDevices()
+    }
+
+    /// Discovers input devices off the main thread and publishes the result on
+    /// the main queue. `AVCaptureDevice.DiscoverySession` can take tens to
+    /// hundreds of milliseconds, so running it synchronously (e.g. during
+    /// `init`) needlessly slows app launch. The microphone list is only needed
+    /// by the Settings UI — recording uses `selectedMicrophoneID` directly — so
+    /// it's safe to populate asynchronously.
+    func refreshAvailableMicrophonesAsync() {
+        guard !isRecording, !audioRecorder.isRecording else {
+            needsMicrophoneRefreshAfterRecording = true
+            return
+        }
+
+        needsMicrophoneRefreshAfterRecording = false
+        DispatchQueue.global(qos: .utility).async { [weak self] in
+            let devices = AudioDevice.availableInputDevices()
+            DispatchQueue.main.async {
+                guard let self else { return }
+                guard !self.isRecording, !self.audioRecorder.isRecording else {
+                    // Recording started while discovery was in flight — defer
+                    // so the list refreshes once recording ends.
+                    self.needsMicrophoneRefreshAfterRecording = true
+                    return
+                }
+                self.availableMicrophones = devices
+            }
+        }
     }
 
     private func refreshAvailableMicrophonesIfNeeded() {
@@ -2588,7 +2695,8 @@ final class AppState: ObservableObject, @unchecked Sendable {
             baseURL: apiBaseURL,
             preferredModel: postProcessingModel,
             preferredFallbackModel: postProcessingFallbackModel,
-            instructionExecutionGuardEnabled: instructionExecutionGuardEnabled
+            instructionExecutionGuardEnabled: instructionExecutionGuardEnabled,
+            reasoningEffortOverride: postProcessingReasoningEffortOverride
         )
 
             let activeRealtime = self.realtimeService
@@ -2836,7 +2944,14 @@ final class AppState: ObservableObject, @unchecked Sendable {
             for audioFileName in removedAudioFileNames {
                 Self.deleteAudioFile(audioFileName)
             }
-            pipelineHistory = pipelineHistoryStore.loadAllHistory()
+            // Update the in-memory list in place rather than reloading the
+            // entire store (which would re-read every base64 screenshot blob
+            // from disk on each dictation). Newest entries sort to the front.
+            pipelineHistoryMutationGeneration += 1
+            pipelineHistory.insert(newEntry, at: 0)
+            if pipelineHistory.count > maxPipelineHistoryCount {
+                pipelineHistory.removeLast(pipelineHistory.count - maxPipelineHistoryCount)
+            }
         } catch {
             errorMessage = "Unable to save run history entry: \(error.localizedDescription)"
         }

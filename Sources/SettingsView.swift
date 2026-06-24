@@ -21,14 +21,9 @@ private struct SettingsCard<Content: View>: View {
                 .font(.headline)
             content
         }
-        .padding(16)
+        .padding(18)
         .frame(maxWidth: .infinity, alignment: .leading)
-        .background(Color(nsColor: .controlBackgroundColor).opacity(0.5))
-        .cornerRadius(10)
-        .overlay(
-            RoundedRectangle(cornerRadius: 10)
-                .stroke(Color.primary.opacity(0.06), lineWidth: 1)
-        )
+        .liquidSurface(cornerRadius: 14)
     }
 }
 
@@ -176,6 +171,23 @@ struct ProviderSettingsFields: View {
                     appState.postProcessingFallbackModel = AppState.defaultPostProcessingFallbackModel
                 }
             )
+
+            VStack(alignment: .leading, spacing: 6) {
+                Text("Post-Processing Reasoning")
+                    .font(.caption.weight(.semibold))
+                Text("Controls how much the cleanup model \"thinks\" before answering. Set to Off to disable reasoning entirely on models that support it (e.g. Groq Qwen3 / gpt-oss) — faster and fewer tokens. Automatic leaves each model's default untouched.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                Picker("", selection: $appState.postProcessingReasoningEffort) {
+                    ForEach(AppState.postProcessingReasoningEffortOptions, id: \.value) { option in
+                        Text(option.label).tag(option.value)
+                    }
+                }
+                .accessibilityLabel("Post-Processing Reasoning")
+                .labelsHidden()
+                .pickerStyle(.menu)
+                .frame(maxWidth: 360, alignment: .leading)
+            }
 
             ModelDropdownView(
                 title: "Context Model",
@@ -356,12 +368,7 @@ struct SettingsView: View {
                         appState.selectedSettingsTab = tab
                     } label: {
                         SettingsSidebarRow(title: tab.title, icon: tab.icon)
-                            .background(
-                                RoundedRectangle(cornerRadius: 6)
-                                    .fill(appState.selectedSettingsTab == tab
-                                          ? Color.accentColor.opacity(0.15)
-                                          : Color.clear)
-                            )
+                            .liquidSelection(isSelected: appState.selectedSettingsTab == tab)
                     }
                     .buttonStyle(.plain)
                 }
@@ -369,23 +376,25 @@ struct SettingsView: View {
                 Spacer()
             }
             .padding(10)
-            .frame(width: 180)
-            .background(Color(nsColor: .windowBackgroundColor))
+            .frame(width: 184)
+            .background(.regularMaterial)
 
             Divider()
 
-            Group {
-                switch appState.selectedSettingsTab {
-                case .general, .none:
-                    GeneralSettingsView()
-                case .prompts:
-                    PromptsSettingsView()
-                case .macros:
-                    VoiceMacrosSettingsView()
-                case .runLog:
-                    RunLogView()
-                case .debug:
-                    DebugSettingsView()
+            LiquidGlassGroup {
+                Group {
+                    switch appState.selectedSettingsTab {
+                    case .general, .none:
+                        GeneralSettingsView()
+                    case .prompts:
+                        PromptsSettingsView()
+                    case .macros:
+                        VoiceMacrosSettingsView()
+                    case .runLog:
+                        RunLogView()
+                    case .debug:
+                        DebugSettingsView()
+                    }
                 }
             }
             .frame(maxWidth: .infinity, maxHeight: .infinity)
@@ -1973,7 +1982,7 @@ struct RunLogView: View {
                 .frame(maxWidth: .infinity)
             } else {
                 ScrollView {
-                    VStack(spacing: 12) {
+                    LazyVStack(spacing: 12) {
                         ForEach(appState.pipelineHistory) { item in
                             RunLogEntryView(item: item)
                         }
@@ -2176,13 +2185,20 @@ struct RunLogEntryView: View {
                             title: "Capture Context",
                             content: {
                                 VStack(alignment: .leading, spacing: 6) {
-                                    if let dataURL = item.contextScreenshotDataURL,
-                                       let image = imageFromDataURL(dataURL) {
-                                        Image(nsImage: image)
-                                            .resizable()
-                                            .aspectRatio(contentMode: .fit)
-                                            .frame(maxHeight: 120)
-                                            .cornerRadius(4)
+                                    if let dataURL = item.contextScreenshotDataURL {
+                                        DataURLImageView(dataURL: dataURL) { image in
+                                            Image(nsImage: image)
+                                                .resizable()
+                                                .aspectRatio(contentMode: .fit)
+                                                .frame(maxHeight: 120)
+                                                .cornerRadius(4)
+                                        } placeholder: {
+                                            RoundedRectangle(cornerRadius: 4)
+                                                .fill(Color(nsColor: .controlBackgroundColor))
+                                                .frame(height: 120)
+                                                .frame(maxWidth: .infinity)
+                                                .overlay(ProgressView().controlSize(.small))
+                                        }
                                     }
 
                                     if let prompt = item.contextPrompt, !prompt.isEmpty {

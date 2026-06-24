@@ -93,55 +93,73 @@ struct PipelineDebugContentView: View {
                 .font(.caption)
                 .foregroundStyle(isScreenshotUnavailable(status) ? .red : .secondary)
 
-            if let dataURL,
-               let image = imageFromDataURL(dataURL) {
-                ScrollView([.horizontal, .vertical]) {
-                    Image(nsImage: image)
-                        .resizable()
-                        .aspectRatio(contentMode: .fit)
-                        .frame(maxWidth: .infinity, minHeight: 180, maxHeight: 320, alignment: .center)
-                        .padding(10)
-                }
-                .frame(maxHeight: 320)
-                .background(Color(nsColor: .textBackgroundColor))
-                .overlay(RoundedRectangle(cornerRadius: 6).stroke(Color.secondary.opacity(0.2)))
-                if let payloadBytes = screenshotPayloadBytes(dataURL: dataURL) {
-                    Text("Screenshot payload: \(payloadBytes / 1024) KB (Base64)")
-                        .font(.caption2)
-                        .foregroundStyle(.secondary)
-                }
-
-                HStack(spacing: 8) {
-                    Button("Open in Preview") {
-                        openImageInPreview(image)
+            if let dataURL {
+                // Decode off the main thread and cache the result so opening or
+                // re-rendering this panel never stalls the UI decoding the
+                // base64 payload.
+                DataURLImageView(dataURL: dataURL) { image in
+                    loadedScreenshot(image: image, dataURL: dataURL)
+                } placeholder: {
+                    screenshotBox {
+                        HStack(spacing: 8) {
+                            ProgressView().controlSize(.small)
+                            Text("Loading screenshot…")
+                                .font(.callout)
+                                .foregroundStyle(.secondary)
+                        }
+                        .frame(maxWidth: .infinity, minHeight: 120)
                     }
-                    .font(.body)
-
-                    Button("Copy Screenshot") {
-                        copyImageToPasteboard(image)
-                    }
-                    .font(.body)
                 }
             } else {
-                VStack(alignment: .leading, spacing: 8) {
+                screenshotBox {
                     Text("No screenshot image available.")
                         .font(.callout)
                         .foregroundStyle(.secondary)
                         .padding(10)
+                        .frame(maxWidth: .infinity, alignment: .leading)
                 }
-                .frame(maxWidth: .infinity, alignment: .leading)
-                .background(Color(nsColor: .textBackgroundColor))
-                .overlay(RoundedRectangle(cornerRadius: 6).stroke(Color.secondary.opacity(0.2)))
             }
         }
     }
 
-    private func screenshotPayloadBytes(dataURL: String) -> Int? {
-        guard let commaIndex = dataURL.lastIndex(of: ",") else {
-            return nil
+    private func loadedScreenshot(image: NSImage, dataURL: String) -> some View {
+        VStack(alignment: .leading, spacing: 6) {
+            ScrollView([.horizontal, .vertical]) {
+                Image(nsImage: image)
+                    .resizable()
+                    .aspectRatio(contentMode: .fit)
+                    .frame(maxWidth: .infinity, minHeight: 180, maxHeight: 320, alignment: .center)
+                    .padding(10)
+            }
+            .frame(maxHeight: 320)
+            .background(Color(nsColor: .textBackgroundColor))
+            .overlay(RoundedRectangle(cornerRadius: 6).stroke(Color.secondary.opacity(0.2)))
+
+            if let payloadBytes = base64PayloadByteCount(forDataURL: dataURL) {
+                Text("Screenshot payload: \(payloadBytes / 1024) KB (Base64)")
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+            }
+
+            HStack(spacing: 8) {
+                Button("Open in Preview") {
+                    openImageInPreview(image)
+                }
+                .font(.body)
+
+                Button("Copy Screenshot") {
+                    copyImageToPasteboard(image)
+                }
+                .font(.body)
+            }
         }
-        let base64 = String(dataURL[dataURL.index(after: commaIndex)...])
-        return Data(base64Encoded: base64, options: .ignoreUnknownCharacters)?.count
+    }
+
+    private func screenshotBox<Content: View>(@ViewBuilder _ content: () -> Content) -> some View {
+        content()
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .background(Color(nsColor: .textBackgroundColor))
+            .overlay(RoundedRectangle(cornerRadius: 6).stroke(Color.secondary.opacity(0.2)))
     }
 
     private func isScreenshotUnavailable(_ status: String) -> Bool {

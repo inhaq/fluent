@@ -35,6 +35,12 @@ final class RealtimeTranscriptionService {
     private let stateQueue = DispatchQueue(label: "com.zachlatta.freeflow.realtime.state")
     private var finalText: String = ""
     private var partialText: String = ""
+    // Coalesce appended PCM into ~100ms chunks before encoding/sending. Capture
+    // buffers arrive ~100x/sec; base64-encoding and JSON-wrapping each one into
+    // its own WebSocket frame is needlessly allocation- and syscall-heavy.
+    // 24 kHz mono PCM16 = 48,000 bytes/sec, so ~4,800 bytes ≈ 100ms.
+    private static let audioFlushByteThreshold = 4_800
+    private var pendingAudio = Data()
     private var finalContinuation: CheckedContinuation<String, Error>?
     private var commitSent: Bool = false
     private var closed: Bool = false
@@ -93,6 +99,7 @@ final class RealtimeTranscriptionService {
         stateQueue.sync {
             guard !closed else { return }
             closed = true
+            pendingAudio.removeAll(keepingCapacity: false)
             if let cont = finalContinuation {
                 finalContinuation = nil
                 cont.resume(throwing: CancellationError())
@@ -107,35 +114,58 @@ final class RealtimeTranscriptionService {
     /// Append 16-bit little-endian PCM samples. The caller owns rate matching
     /// (the service declares 24 kHz mono in `session.update`, matching the
     /// OpenAI Realtime default).
+    ///
+    /// Samples are coalesced into ~100ms chunks and only encoded/sent once the
+    /// buffer crosses ``audioFlushByteThreshold``; any tail shorter than that is
+    /// flushed by ``commitAndAwaitFinal``.
     func appendPCM16(_ data: Data) {
-        let currentTask: URLSessionWebSocketTask? = stateQueue.sync {
-            task
+        guard !data.isEmpty else { return }
+        let pending: (task: URLSessionWebSocketTask, chunk: Data)? = stateQueue.sync {
+            guard let task, !commitSent, !closed else { return nil }
+            pendingAudio.append(data)
+            guard pendingAudio.count >= Self.audioFlushByteThreshold else { return nil }
+            let chunk = pendingAudio
+            pendingAudio.removeAll(keepingCapacity: true)
+            return (task, chunk)
         }
-        guard let currentTask, !data.isEmpty else { return }
+        if let pending {
+            sendAudioChunk(pending.chunk, over: pending.task)
+        }
+    }
+
+    private func sendAudioChunk(_ data: Data, over task: URLSessionWebSocketTask) {
         let audioB64 = data.base64EncodedString()
-        let message: [String: Any] = [
+        send([
             "type": "input_audio_buffer.append",
             "audio": audioB64,
-        ]
-        send(message, over: currentTask)
+        ], over: task)
     }
 
     /// Signal end-of-input, wait for the final transcript, return it.
     func commitAndAwaitFinal() async throws -> String {
-        let currentTask: URLSessionWebSocketTask? = stateQueue.sync {
-            task
+        // Atomically claim the commit, capture the connection, and drain any
+        // buffered tail audio in one critical section so a concurrent
+        // appendPCM16 cannot strand sub-threshold samples after commit.
+        let snapshot: (task: URLSessionWebSocketTask, tail: Data?, alreadyCommitted: Bool)? = stateQueue.sync {
+            guard let task else { return nil }
+            let alreadyCommitted = commitSent
+            if !alreadyCommitted {
+                commitSent = true
+                commitEventCount = serverEventCount
+                postCommitCompleted = false
+            }
+            let tail = pendingAudio.isEmpty ? nil : pendingAudio
+            pendingAudio.removeAll(keepingCapacity: false)
+            return (task, tail, alreadyCommitted)
         }
-        guard let currentTask else {
+        guard let snapshot else {
             throw RealtimeTranscriptionError.notConnected
         }
-        let alreadyCommitted: Bool = stateQueue.sync {
-            if commitSent { return true }
-            commitSent = true
-            commitEventCount = serverEventCount
-            postCommitCompleted = false
-            return false
+        let currentTask = snapshot.task
+        if let tail = snapshot.tail {
+            sendAudioChunk(tail, over: currentTask)
         }
-        if !alreadyCommitted {
+        if !snapshot.alreadyCommitted {
             send(["type": "input_audio_buffer.commit"], over: currentTask)
         }
 

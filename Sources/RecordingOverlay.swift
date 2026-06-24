@@ -168,8 +168,16 @@ final class RecordingOverlayManager {
     }
 
     func updateAudioLevel(_ level: Float) {
-        DispatchQueue.main.async {
-            self.overlayState.audioLevel = level
+        // The recorder already throttles and delivers these on the main thread
+        // (via the Combine sink in AppState). Assign directly when we're on the
+        // main thread to avoid an extra runloop hop per update; only bounce to
+        // main when called from a background context.
+        if Thread.isMainThread {
+            overlayState.audioLevel = level
+        } else {
+            DispatchQueue.main.async {
+                self.overlayState.audioLevel = level
+            }
         }
     }
 

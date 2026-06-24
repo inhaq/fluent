@@ -73,6 +73,25 @@ final class PipelineHistoryStore {
         return result
     }
 
+    /// Loads history off the main thread and delivers the result on the main
+    /// queue. Used at launch so the (potentially several-MB) base64 screenshot
+    /// payloads aren't materialized synchronously on the main thread during
+    /// app startup.
+    func loadAllHistoryAsync(completion: @escaping ([PipelineHistoryItem]) -> Void) {
+        guard isStoreLoaded else {
+            DispatchQueue.main.async { completion([]) }
+            return
+        }
+        let context = container.newBackgroundContext()
+        context.perform {
+            let request = self.pipelineHistoryRequest()
+            request.sortDescriptors = [NSSortDescriptor(key: "timestamp", ascending: false)]
+            let entities = (try? context.fetch(request)) ?? []
+            let items = entities.compactMap(Self.makeHistoryItem(from:))
+            DispatchQueue.main.async { completion(items) }
+        }
+    }
+
     func append(_ item: PipelineHistoryItem, maxCount: Int) throws -> [String] {
         guard isStoreLoaded else { return [] }
         try insert(item)
