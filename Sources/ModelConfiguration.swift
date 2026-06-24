@@ -16,6 +16,7 @@ public struct ModelConfiguration {
         "openai/gpt-oss-120b",
         "openai/gpt-oss-safeguard-20b",
         "qwen/qwen3-32b",
+        "qwen/qwen3.6-27b",
         "allam-2-7b",
         "groq/compound",
         "groq/compound-mini",
