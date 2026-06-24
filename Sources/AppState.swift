@@ -1060,13 +1060,33 @@ final class AppState: ObservableObject, @unchecked Sendable {
         return trimmed.isEmpty ? apiKey : trimmed
     }
 
+    /// Builds a ``TranscriptionService`` configured with the resolved
+    /// transcription credentials, model, language, and a vocabulary biasing
+    /// prompt derived from the user's custom vocabulary.
     func makeTranscriptionService() throws -> TranscriptionService {
         try TranscriptionService(
             apiKey: resolvedTranscriptionAPIKey,
             baseURL: resolvedTranscriptionBaseURL,
             transcriptionModel: transcriptionModel,
-            language: resolvedTranscriptionLanguage
+            language: resolvedTranscriptionLanguage,
+            prompt: transcriptionBiasingPrompt()
         )
+    }
+
+    /// Build a Whisper biasing prompt from the user's custom vocabulary so the
+    /// raw transcript spells domain terms (names, products, acronyms) the way
+    /// the user expects. Returns nil when no vocabulary is configured.
+    private func transcriptionBiasingPrompt() -> String? {
+        let terms = customVocabulary
+            .split(whereSeparator: { $0 == "\n" || $0 == "," || $0 == ";" })
+            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+            .filter { !$0.isEmpty }
+
+        guard !terms.isEmpty else { return nil }
+
+        var seen = Set<String>()
+        let uniqueTerms = terms.filter { seen.insert($0.lowercased()).inserted }
+        return uniqueTerms.joined(separator: ", ")
     }
 
     private var resolvedTranscriptionLanguage: String? {

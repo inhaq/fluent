@@ -8,17 +8,32 @@ class TranscriptionService {
     private let baseURL: URL
     private let transcriptionModel: String
     private let language: String?
+    /// Optional biasing prompt sent to Whisper. Whisper uses this as a hint for
+    /// spelling and rare/domain terms (names, jargon, acronyms), which sharply
+    /// improves accuracy on the user's custom vocabulary. Capped to Whisper's
+    /// ~224-token context window (see `init`).
+    private let prompt: String?
     private let transcriptionResponseFormat = "verbose_json"
     private var transcriptionTimeoutSeconds: TimeInterval {
         let override = UserDefaults.standard.double(forKey: "transcription_timeout_seconds")
         return override > 0 ? override : 20
     }
 
+    /// Creates a transcription client for an OpenAI-compatible
+    /// `audio/transcriptions` endpoint.
+    /// - Parameters:
+    ///   - apiKey: Bearer token for the provider.
+    ///   - baseURL: Provider base URL; normalized and validated.
+    ///   - transcriptionModel: Whisper model id (defaults to `whisper-large-v3`).
+    ///   - language: Optional ISO language hint; `nil` lets Whisper auto-detect.
+    ///   - prompt: Optional biasing prompt (e.g. custom vocabulary) trimmed and
+    ///     capped to ~800 characters to stay within Whisper's context window.
     init(
         apiKey: String,
         baseURL: String = "https://api.groq.com/openai/v1",
         transcriptionModel: String = "whisper-large-v3",
-        language: String? = nil
+        language: String? = nil,
+        prompt: String? = nil
     ) throws {
         self.apiKey = apiKey
         self.baseURL = try Self.normalizedBaseURL(from: baseURL)
@@ -26,9 +41,19 @@ class TranscriptionService {
         self.transcriptionModel = trimmedModel.isEmpty ? "whisper-large-v3" : trimmedModel
         let trimmedLanguage = language?.trimmingCharacters(in: .whitespacesAndNewlines)
         self.language = (trimmedLanguage?.isEmpty == false) ? trimmedLanguage : nil
+        // Whisper's prompt window is ~224 tokens. Trim to a safe character
+        // budget so a large vocabulary list never overflows or gets rejected.
+        let trimmedPrompt = prompt?.trimmingCharacters(in: .whitespacesAndNewlines)
+        if let trimmedPrompt, !trimmedPrompt.isEmpty {
+            self.prompt = String(trimmedPrompt.prefix(800))
+        } else {
+            self.prompt = nil
+        }
     }
 
     // Validate API key by hitting a lightweight endpoint
+    /// Validates an API key by issuing a lightweight authenticated request to
+    /// the provider's `models` endpoint. Returns `true` only on HTTP 200.
     static func validateAPIKey(_ key: String, baseURL: String = "https://api.groq.com/openai/v1") async -> Bool {
         let trimmed = key.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return false }
@@ -47,7 +72,9 @@ class TranscriptionService {
         }
     }
 
-    // Upload audio file, submit for transcription, poll until done, return text
+    /// Uploads the recorded audio file for transcription and returns the
+    /// transcribed text, racing the request against a configurable timeout and
+    /// honoring cancellation.
     func transcribe(fileURL: URL) async throws -> String {
         guard !Task.isCancelled else {
             throw CancellationError()
@@ -92,11 +119,13 @@ class TranscriptionService {
         }
     }
 
-    // Send audio file for transcription and return text
+    /// Performs the underlying transcription request for the given audio file.
     private func transcribeAudio(fileURL: URL) async throws -> String {
         return try await transcribeAudioWithURLSession(fileURL: fileURL)
     }
 
+    /// Issues the multipart upload to the provider's `audio/transcriptions`
+    /// endpoint via `URLSession` and returns the validated transcript.
     private func transcribeAudioWithURLSession(fileURL: URL) async throws -> String {
         let url = baseURL
             .appendingPathComponent("audio")
@@ -115,6 +144,7 @@ class TranscriptionService {
             model: transcriptionModel,
             responseFormat: transcriptionResponseFormat,
             language: language,
+            prompt: prompt,
             boundary: boundary
         )
 
@@ -137,6 +167,9 @@ class TranscriptionService {
         }
     }
 
+    /// Validates the HTTP response from a transcription upload, mapping
+    /// non-200 statuses to user-readable errors, and parses the transcript on
+    /// success.
     private func validateTranscriptionResponse(data: Data, response: URLResponse, fileURL: URL) throws -> String {
         guard let httpResponse = response as? HTTPURLResponse else {
             throw TranscriptionError.submissionFailed("No response from server")
@@ -161,6 +194,8 @@ class TranscriptionService {
 
         return try parseTranscript(from: data)
     }
+    /// Returns the MIME content type for a given audio file name based on its
+    /// extension, defaulting to `audio/mp4`.
     private func audioContentType(for fileName: String) -> String {
         if fileName.lowercased().hasSuffix(".wav") {
             return "audio/wav"
@@ -174,17 +209,24 @@ class TranscriptionService {
         return "audio/mp4"
     }
 
+    /// Returns the size of the file at `fileURL` in bytes, or `-1` if it cannot
+    /// be determined.
     private func fileSizeBytes(for fileURL: URL) -> Int64 {
         let attributes = try? FileManager.default.attributesOfItem(atPath: fileURL.path)
         return (attributes?[.size] as? NSNumber)?.int64Value ?? -1
     }
 
+    /// Builds the `multipart/form-data` body for a Whisper transcription
+    /// request, including the model, response format, deterministic
+    /// `temperature=0`, optional language hint, optional biasing prompt, and
+    /// the audio file payload.
     private func makeMultipartBody(
         audioData: Data,
         fileName: String,
         model: String,
         responseFormat: String,
         language: String?,
+        prompt: String?,
         boundary: String
     ) -> Data {
         var body = Data()
@@ -201,10 +243,25 @@ class TranscriptionService {
         append("Content-Disposition: form-data; name=\"response_format\"\r\n\r\n")
         append("\(responseFormat)\r\n")
 
+        // temperature=0 makes Whisper deterministic and greedy, which reduces
+        // the random word substitutions/hallucinations that make dictation feel
+        // like it "didn't transcribe what I said".
+        append("--\(boundary)\r\n")
+        append("Content-Disposition: form-data; name=\"temperature\"\r\n\r\n")
+        append("0\r\n")
+
         if let language, !language.isEmpty {
             append("--\(boundary)\r\n")
             append("Content-Disposition: form-data; name=\"language\"\r\n\r\n")
             append("\(language)\r\n")
+        }
+
+        // Bias Whisper toward the user's custom vocabulary (names, jargon,
+        // acronyms) so domain terms are spelled correctly in the raw transcript.
+        if let prompt, !prompt.isEmpty {
+            append("--\(boundary)\r\n")
+            append("Content-Disposition: form-data; name=\"prompt\"\r\n\r\n")
+            append("\(prompt)\r\n")
         }
 
         append("--\(boundary)\r\n")
@@ -287,13 +344,17 @@ class TranscriptionService {
     }
 
     // Whisper-large-v3 hallucinates common short phrases on silence/background
-    // noise. Drop them when whisper itself reports a high no_speech_prob.
-    // Add a new (phrase, minNoSpeechProb) pair here to filter more hallucinations.
+    // noise. Drop them ONLY when whisper itself is highly confident the clip
+    // contains no speech. Add a new phrase here to filter more hallucinations.
     //
-    // Thresholds tuned on ~500 samples from quiet and noisy environments, including
-    // both positive cases (real "thank you" speech) and empty-audio cases. Kept
-    // conservative to minimize false positives (filtering real user speech).
-    // Normal speech included audios have very low no_speech_prob.
+    // IMPORTANT: this filter must never eat real speech. A user genuinely
+    // saying "thank you" or "you" is common, and Whisper routinely reports a
+    // moderate no_speech_prob (0.1-0.5) on such short, real utterances. The
+    // previous 0.1 threshold therefore silently discarded legitimate dictation.
+    // We now require a very high no_speech_prob (>= 0.8) AND evaluate the
+    // minimum across all segments, so a single clearly-spoken segment keeps the
+    // transcript. This keeps the silence/noise hallucination guard while
+    // strongly favoring not dropping what the user actually said.
     private let hallucinationPhrases = [
         "thank you",
         "thank you for watching",
@@ -307,8 +368,11 @@ class TranscriptionService {
         "you"
     ]
 
-    private let hallucinationNoSpeechThreshold = 0.1
+    private let hallucinationNoSpeechThreshold = 0.8
 
+    /// Parses the transcript text from a provider response. JSON responses are
+    /// decoded and run through the hallucination filter; plain-text responses
+    /// are normalized into a single trimmed string.
     private func parseTranscript(from data: Data) throws -> String {
         if let json = try JSONSerialization.jsonObject(with: data) as? [String: Any],
            let text = json["text"] as? String {
@@ -330,6 +394,11 @@ class TranscriptionService {
         return text
     }
 
+    /// Determines whether a transcript is a Whisper silence/noise
+    /// hallucination. Returns `true` only when the text matches a known
+    /// hallucinated phrase and the minimum `no_speech_prob` across all segments
+    /// meets ``hallucinationNoSpeechThreshold`` (i.e. Whisper is highly
+    /// confident the clip contains no speech).
     private func isHallucination(text: String, json: [String: Any]) -> Bool {
         let normalized = text
             .lowercased()
@@ -348,7 +417,13 @@ class TranscriptionService {
             return false
         }
 
-        guard let noSpeechProb = segments.first?["no_speech_prob"] as? Double else {
+        // Evaluate the *minimum* no_speech_prob across every segment. If any
+        // segment is confidently speech (low no_speech_prob), the clip contains
+        // real audio and must not be discarded — even if other segments look
+        // silent. Only when the entire clip is confidently non-speech do we
+        // treat the phrase as a hallucination.
+        let noSpeechProbs = segments.compactMap { $0["no_speech_prob"] as? Double }
+        guard let minNoSpeechProb = noSpeechProbs.min() else {
             os_log(
                 .info,
                 log: transcriptionLog,
@@ -357,7 +432,7 @@ class TranscriptionService {
             )
             return false
         }
-        return noSpeechProb >= hallucinationNoSpeechThreshold
+        return minNoSpeechProb >= hallucinationNoSpeechThreshold
     }
 }
 
