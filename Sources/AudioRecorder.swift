@@ -94,6 +94,13 @@ final class AudioRecorder: NSObject, ObservableObject, AVCaptureAudioDataOutputS
     // lifetime of a session, so cache it keyed by the format description.
     private var cachedSourceFormatDescription: CMFormatDescription?
     private var cachedSourceFormat: AVAudioFormat?
+    // UID of the device the current capture session is configured for. Lets the
+    // recording path reuse a pre-warmed session only when the device matches.
+    private var currentDeviceUID: String?
+    // True while an idle session is kept running ahead of recording (prewarm).
+    private var isPrewarmed = false
+    private var prewarmCooldownTimer: DispatchSourceTimer?
+    private static let prewarmIdleTimeout: TimeInterval = 20.0
     // Throttle state for publishing the live audio level to the UI.
     private var lastAudioLevelPublish: CFAbsoluteTime = 0
     private static let audioLevelPublishInterval: CFTimeInterval = 1.0 / 30.0
@@ -134,6 +141,25 @@ final class AudioRecorder: NSObject, ObservableObject, AVCaptureAudioDataOutputS
     private static let watchdogTimeout: TimeInterval = 2.0
     private static let sampleRateLogLimit = 40
 
+    /// Sample-rate conversion quality for the downsamplers (mic -> 16 kHz file
+    /// and mic -> 24 kHz realtime PCM16). Defaults to `.max`, which avoids
+    /// aliasing artifacts that hurt word recognition, but is the most
+    /// CPU-intensive setting and runs on every capture buffer (~100x/sec). It
+    /// can be lowered without a rebuild for profiling via the
+    /// `audio_sample_rate_converter_quality` user default
+    /// (min/low/medium/high/max) so the right quality/CPU tradeoff is decided
+    /// with Instruments instead of guesswork.
+    private static func configuredConverterQuality() -> AVAudioQuality {
+        switch UserDefaults.standard.string(forKey: "audio_sample_rate_converter_quality")?.lowercased() {
+        case "min": return .min
+        case "low": return .low
+        case "medium": return .medium
+        case "high": return .high
+        case "max": return .max
+        default: return .max
+        }
+    }
+
     override init() {
         super.init()
         sessionQueue.setSpecific(key: Self.sessionQueueKey, value: 1)
@@ -142,6 +168,7 @@ final class AudioRecorder: NSObject, ObservableObject, AVCaptureAudioDataOutputS
     deinit {
         let cleanup = {
             self.cancelWatchdog()
+            self.cancelPrewarmCooldownLocked()
             self.teardownSessionLocked()
         }
 
@@ -237,6 +264,8 @@ final class AudioRecorder: NSObject, ObservableObject, AVCaptureAudioDataOutputS
     private func teardownSessionLocked() {
         removeSessionObservers()
         isSessionInterrupted = false
+        isPrewarmed = false
+        currentDeviceUID = nil
 
         audioDataOutput?.setSampleBufferDelegate(nil, queue: nil)
         if let session = captureSession, session.isRunning {
@@ -553,10 +582,12 @@ final class AudioRecorder: NSObject, ObservableObject, AVCaptureAudioDataOutputS
                 return existing
             }
             let new = AVAudioConverter(from: sourceFormat, to: targetFormat)
-            // Use the highest-quality sample-rate conversion so downsampling a
+            // Use a high-quality sample-rate conversion so downsampling a
             // 44.1/48 kHz mic to Whisper's 16 kHz does not introduce aliasing
-            // artifacts that degrade word recognition.
-            new?.sampleRateConverterQuality = .max
+            // artifacts that degrade word recognition. Quality is configurable
+            // (defaults to .max) so it can be profiled — see
+            // configuredConverterQuality().
+            new?.sampleRateConverterQuality = Self.configuredConverterQuality()
             existing = new
             return new
         }
@@ -609,9 +640,34 @@ final class AudioRecorder: NSObject, ObservableObject, AVCaptureAudioDataOutputS
     }
 
     private func makeSession(deviceUID: String?, outputURL: URL) throws {
-        teardownSessionLocked()
+        cancelPrewarmCooldownLocked()
+        let device = try preferredCaptureDevice(for: deviceUID, reason: "start recording")
 
-        let device = try preferredCaptureDevice(for: deviceUID, reason: "initial start")
+        // Reuse a pre-warmed, already-running session for the same device so
+        // recording starts without paying AVCaptureSession.startRunning() again.
+        if isPrewarmed,
+           let session = captureSession,
+           session.isRunning,
+           currentDeviceUID == device.uniqueID {
+            isPrewarmed = false
+            resetFileWritingStateLocked()
+            tempFileURL = outputURL
+            os_log(.info, log: recordingLog, "reusing pre-warmed capture session for %{public}@", device.localizedName)
+            return
+        }
+
+        try configureSessionLocked(device: device)
+        isPrewarmed = false
+        resetFileWritingStateLocked()
+        tempFileURL = outputURL
+    }
+
+    /// Builds, configures, and starts a capture session for `device`. Shared by
+    /// the recording start path and pre-warming. Does not touch file-writing
+    /// state or `tempFileURL`; callers do that when they actually begin
+    /// recording.
+    private func configureSessionLocked(device: AVCaptureDevice) throws {
+        teardownSessionLocked()
 
         let session = AVCaptureSession()
         let dataOutput = AVCaptureAudioDataOutput()
@@ -657,16 +713,10 @@ final class AudioRecorder: NSObject, ObservableObject, AVCaptureAudioDataOutputS
         captureSession = session
         currentInput = input
         audioDataOutput = dataOutput
+        currentDeviceUID = device.uniqueID
         isSessionInterrupted = false
-        activeAudioFile = nil
-        activeAudioFormat = nil
         recordingConverterLock.withLock { $0 = nil }
         pcm16ConverterLock.withLock { $0 = nil }
-        recordedFrameCount = 0
-        loggedCaptureFormat = false
-        fileWriteErrorLock.withLock { _ in
-            fileWriteError = nil
-        }
         installSessionObservers(for: session)
 
         os_log(.info, log: recordingLog, "configured capture session with device %{public}@ [uid=%{public}@]", device.localizedName, device.uniqueID)
@@ -677,7 +727,83 @@ final class AudioRecorder: NSObject, ObservableObject, AVCaptureAudioDataOutputS
         }
 
         os_log(.info, log: recordingLog, "capture session running with device %{public}@ [uid=%{public}@]", device.localizedName, device.uniqueID)
-        tempFileURL = outputURL
+    }
+
+    /// Clears the per-recording file-writer state so a (possibly reused)
+    /// session writes a fresh output file.
+    private func resetFileWritingStateLocked() {
+        activeAudioFile = nil
+        activeAudioFormat = nil
+        recordedFrameCount = 0
+        loggedCaptureFormat = false
+        fileWriteErrorLock.withLock { _ in
+            fileWriteError = nil
+        }
+    }
+
+    /// Pre-warms an idle capture session so the next ``startRecording`` can skip
+    /// the `AVCaptureSession.startRunning()` cost (the dominant first-record
+    /// latency). While warm the session runs but every sample buffer is dropped
+    /// in ``captureOutput`` because `_recording` is false (nothing is written or
+    /// metered). To bound battery use and the time the system mic-in-use
+    /// indicator stays lit, a warm session auto-cools-down after
+    /// ``prewarmIdleTimeout`` if no recording starts. No-op while recording.
+    func prewarm(deviceUID: String? = nil) {
+        sessionQueue.async {
+            guard !self._recording.withLock({ $0 }) else { return }
+            do {
+                let device = try self.preferredCaptureDevice(for: deviceUID, reason: "prewarm")
+                if let session = self.captureSession,
+                   session.isRunning,
+                   self.currentDeviceUID == device.uniqueID {
+                    // Already warm with the right device; just refresh the timer.
+                    self.isPrewarmed = true
+                    self.schedulePrewarmCooldownLocked()
+                    return
+                }
+                try self.configureSessionLocked(device: device)
+                self.isPrewarmed = true
+                self.schedulePrewarmCooldownLocked()
+                os_log(.info, log: recordingLog, "capture session pre-warmed with %{public}@", device.localizedName)
+            } catch {
+                os_log(.error, log: recordingLog, "prewarm failed: %{public}@", error.localizedDescription)
+                self.teardownSessionLocked()
+                self.isPrewarmed = false
+            }
+        }
+    }
+
+    /// Tears down a pre-warmed idle session. No-op while recording (the active
+    /// recording owns the session).
+    func stopPrewarm() {
+        sessionQueue.async {
+            guard self.isPrewarmed, !self._recording.withLock({ $0 }) else { return }
+            self.cancelPrewarmCooldownLocked()
+            self.teardownSessionLocked()
+            self.isPrewarmed = false
+            os_log(.info, log: recordingLog, "pre-warmed capture session torn down")
+        }
+    }
+
+    private func schedulePrewarmCooldownLocked() {
+        cancelPrewarmCooldownLocked()
+        let timer = DispatchSource.makeTimerSource(queue: sessionQueue)
+        timer.schedule(deadline: .now() + Self.prewarmIdleTimeout)
+        timer.setEventHandler { [weak self] in
+            guard let self else { return }
+            guard self.isPrewarmed, !self._recording.withLock({ $0 }) else { return }
+            self.cancelPrewarmCooldownLocked()
+            self.teardownSessionLocked()
+            self.isPrewarmed = false
+            os_log(.info, log: recordingLog, "pre-warm idle timeout — cooling down")
+        }
+        timer.resume()
+        prewarmCooldownTimer = timer
+    }
+
+    private func cancelPrewarmCooldownLocked() {
+        prewarmCooldownTimer?.cancel()
+        prewarmCooldownTimer = nil
     }
 
     func startRecording(deviceUID: String? = nil) throws {
@@ -992,7 +1118,7 @@ final class AudioRecorder: NSObject, ObservableObject, AVCaptureAudioDataOutputS
                 return existing
             }
             let new = AVAudioConverter(from: sourceFormat, to: pcm16TargetFormat)
-            new?.sampleRateConverterQuality = .max
+            new?.sampleRateConverterQuality = Self.configuredConverterQuality()
             existing = new
             return new
         }

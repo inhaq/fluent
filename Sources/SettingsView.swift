@@ -989,6 +989,17 @@ struct GeneralSettingsView: View {
             Text("\(AppName.displayName) restores the audio state it changed when dictation ends.")
                 .font(.caption)
                 .foregroundStyle(.secondary)
+
+            Divider()
+
+            Toggle(
+                "Keep microphone warm between dictations",
+                isOn: $appState.prewarmMicrophoneEnabled
+            )
+
+            Text("Starts recording faster by keeping an idle microphone session ready. The system microphone indicator stays lit for a short while after each dictation, and it uses slightly more power. The session cools down automatically when unused.")
+                .font(.caption)
+                .foregroundStyle(.secondary)
         }
     }
 
@@ -1711,6 +1722,19 @@ struct PromptsSettingsView: View {
             Divider()
 
             VStack(alignment: .leading, spacing: 8) {
+                Toggle(isOn: $appState.captureScreenshotForDictation) {
+                    Text("Capture screenshot for dictation")
+                        .font(.caption.weight(.semibold))
+                }
+
+                Text("When off (recommended for speed), plain dictation uses only app and window metadata for context and skips the screenshot capture and vision analysis. Command mode always captures a screenshot.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+
+            Divider()
+
+            VStack(alignment: .leading, spacing: 8) {
                 Text("Screenshot Resolution")
                     .font(.caption.weight(.semibold))
 
@@ -1903,6 +1927,18 @@ struct RunLogEntryView: View {
     @State private var copiedRawTranscriptResetWorkItem: DispatchWorkItem?
     @State private var copiedCleanedTranscript = false
     @State private var copiedCleanedTranscriptResetWorkItem: DispatchWorkItem?
+    /// Screenshot loaded on demand when this entry is expanded. History rows are
+    /// listed without their (potentially multi-MB) base64 screenshots; we fetch
+    /// the one belonging to this entry only when the user opens it.
+    @State private var lazyScreenshotDataURL: String?
+
+    private var resolvedScreenshotDataURL: String? {
+        item.contextScreenshotDataURL ?? lazyScreenshotDataURL
+    }
+
+    private var hasScreenshotAvailable: Bool {
+        item.contextScreenshotStatus.lowercased().hasPrefix("available")
+    }
 
     private var isError: Bool {
         item.postProcessingStatus.hasPrefix("Error:")
@@ -2005,10 +2041,14 @@ struct RunLogEntryView: View {
                     }
 
                     actionIconButton(systemName: "square.and.arrow.up", help: "Export run log") {
-                        TestCaseExporter.exportWithSavePanel(
-                            item: item,
-                            audioDirURL: AppState.audioStorageDirectory()
-                        )
+                        Task { @MainActor in
+                            let dataURL = resolvedScreenshotDataURL
+                                ?? (hasScreenshotAvailable ? await appState.loadHistoryScreenshot(for: item.id) : nil)
+                            TestCaseExporter.exportWithSavePanel(
+                                item: item.withContextScreenshotDataURL(dataURL),
+                                audioDirURL: AppState.audioStorageDirectory()
+                            )
+                        }
                     }
 
                     actionIconButton(
@@ -2078,7 +2118,7 @@ struct RunLogEntryView: View {
                             title: "Capture Context",
                             content: {
                                 VStack(alignment: .leading, spacing: 6) {
-                                    if let dataURL = item.contextScreenshotDataURL {
+                                    if let dataURL = resolvedScreenshotDataURL {
                                         DataURLImageView(dataURL: dataURL) { image in
                                             Image(nsImage: image)
                                                 .resizable()
@@ -2092,6 +2132,17 @@ struct RunLogEntryView: View {
                                                 .frame(maxWidth: .infinity)
                                                 .overlay(ProgressView().controlSize(.small))
                                         }
+                                    } else if hasScreenshotAvailable {
+                                        RoundedRectangle(cornerRadius: 4)
+                                            .fill(Color(nsColor: .controlBackgroundColor))
+                                            .frame(height: 120)
+                                            .frame(maxWidth: .infinity)
+                                            .overlay(ProgressView().controlSize(.small))
+                                            .task {
+                                                if lazyScreenshotDataURL == nil {
+                                                    lazyScreenshotDataURL = await appState.loadHistoryScreenshot(for: item.id)
+                                                }
+                                            }
                                     }
 
                                     if let prompt = item.contextPrompt, !prompt.isEmpty {

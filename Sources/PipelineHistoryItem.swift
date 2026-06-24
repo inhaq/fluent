@@ -74,4 +74,33 @@ struct PipelineHistoryItem: Identifiable, Codable {
         self.contextBundleIdentifier = contextBundleIdentifier
         self.contextWindowTitle = contextWindowTitle
     }
+
+    /// Returns a copy with the screenshot `data:` URL replaced. Used to hydrate
+    /// an item that was listed without its (lazily loaded) screenshot before an
+    /// operation that needs the full payload, e.g. test-case export.
+    func withContextScreenshotDataURL(_ dataURL: String?) -> PipelineHistoryItem {
+        PipelineHistoryItem(
+            intent: intent,
+            selectedText: selectedText,
+            capturedSelection: capturedSelection,
+            id: id,
+            timestamp: timestamp,
+            rawTranscript: rawTranscript,
+            postProcessedTranscript: postProcessedTranscript,
+            postProcessingPrompt: postProcessingPrompt,
+            systemPrompt: systemPrompt,
+            contextSummary: contextSummary,
+            contextSystemPrompt: contextSystemPrompt,
+            contextPrompt: contextPrompt,
+            contextScreenshotDataURL: dataURL,
+            contextScreenshotStatus: contextScreenshotStatus,
+            postProcessingStatus: postProcessingStatus,
+            debugStatus: debugStatus,
+            customVocabulary: customVocabulary,
+            audioFileName: audioFileName,
+            contextAppName: contextAppName,
+            contextBundleIdentifier: contextBundleIdentifier,
+            contextWindowTitle: contextWindowTitle
+        )
+    }
 }

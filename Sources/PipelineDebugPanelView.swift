@@ -53,9 +53,13 @@ struct PipelineDebugPanelView: View {
 
     private func exportTestCase() {
         guard let item = appState.pipelineHistory.first else { return }
-        TestCaseExporter.exportWithSavePanel(
-            item: item,
-            audioDirURL: AppState.audioStorageDirectory()
-        )
+        Task { @MainActor in
+            let dataURL = item.contextScreenshotDataURL
+                ?? (await appState.loadHistoryScreenshot(for: item.id))
+            TestCaseExporter.exportWithSavePanel(
+                item: item.withContextScreenshotDataURL(dataURL),
+                audioDirURL: AppState.audioStorageDirectory()
+            )
+        }
     }
 }
