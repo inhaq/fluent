@@ -1538,7 +1538,7 @@ final class AppState: ObservableObject, @unchecked Sendable {
                   device.hasMediaType(.audio) else {
                 return
             }
-            self?.refreshAvailableMicrophones()
+            self?.refreshAvailableMicrophonesAsync()
         }
 
         audioDeviceObservers.append(
@@ -1747,7 +1747,13 @@ final class AppState: ObservableObject, @unchecked Sendable {
             }
         }
         hotkeyManager.onEscapeKeyPressed = { [weak self] in
-            self?.handleEscapeKeyPress() ?? false
+            if Thread.isMainThread {
+                return self?.handleEscapeKeyPress() ?? false
+            }
+
+            return DispatchQueue.main.sync {
+                self?.handleEscapeKeyPress() ?? false
+            }
         }
         restartHotkeyMonitoring()
     }

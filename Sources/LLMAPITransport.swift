@@ -30,4 +30,15 @@ enum LLMAPITransport {
         defer { session.finishTasksAndInvalidate() }
         return try await session.upload(for: request, from: bodyData)
     }
+
+    static func upload(
+        for request: URLRequest,
+        fromFile fileURL: URL
+    ) async throws -> (Data, URLResponse) {
+        // Use a fresh session for each upload so a bad reused connection cannot
+        // poison subsequent transcription uploads.
+        let session = makeEphemeralSession()
+        defer { session.finishTasksAndInvalidate() }
+        return try await session.upload(for: request, fromFile: fileURL)
+    }
 }

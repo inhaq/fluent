@@ -20,6 +20,9 @@ enum GlobalShortcutBackendError: LocalizedError {
 final class GlobalShortcutBackend {
     private var eventTap: CFMachPort?
     private var eventTapRunLoopSource: CFRunLoopSource?
+    private var eventTapRunLoop: CFRunLoop?
+    private var eventTapThread: Thread?
+    private let eventTapLifecycleLock = NSLock()
     private var fnKeyIsDown = false
 
     var onInputEvent: ((ShortcutInputEvent) -> ShortcutConsumeDecision)?
@@ -76,22 +79,68 @@ final class GlobalShortcutBackend {
             throw GlobalShortcutBackendError.eventTapRunLoopSourceUnavailable
         }
 
-        CFRunLoopAddSource(CFRunLoopGetMain(), source, .commonModes)
-        CGEvent.tapEnable(tap: tap, enable: true)
-
+        eventTapLifecycleLock.lock()
         eventTap = tap
         eventTapRunLoopSource = source
+        eventTapLifecycleLock.unlock()
+
+        let startupSemaphore = DispatchSemaphore(value: 0)
+        let thread = Thread { [weak self] in
+            autoreleasepool {
+                guard let self else {
+                    startupSemaphore.signal()
+                    return
+                }
+
+                let runLoop = CFRunLoopGetCurrent()
+                self.eventTapLifecycleLock.lock()
+                self.eventTapRunLoop = runLoop
+                self.eventTapLifecycleLock.unlock()
+
+                CFRunLoopAddSource(runLoop, source, .commonModes)
+                CGEvent.tapEnable(tap: tap, enable: true)
+                startupSemaphore.signal()
+                CFRunLoopRun()
+
+                CFRunLoopRemoveSource(runLoop, source, .commonModes)
+                self.eventTapLifecycleLock.lock()
+                if self.eventTapRunLoop === runLoop {
+                    self.eventTapRunLoop = nil
+                }
+                self.eventTapLifecycleLock.unlock()
+            }
+        }
+        thread.name = "\(AppName.displayName) Global Shortcut Event Tap"
+        eventTapThread = thread
+        thread.start()
+        startupSemaphore.wait()
     }
 
     private func tearDownEventTap() {
-        if let source = eventTapRunLoopSource {
-            CFRunLoopRemoveSource(CFRunLoopGetMain(), source, .commonModes)
-        }
+        eventTapLifecycleLock.lock()
+        let source = eventTapRunLoopSource
+        let tap = eventTap
+        let runLoop = eventTapRunLoop
+        eventTapRunLoop = nil
         eventTapRunLoopSource = nil
-        if let tap = eventTap {
+        eventTap = nil
+        eventTapLifecycleLock.unlock()
+        eventTapThread = nil
+
+        if let runLoop {
+            CFRunLoopPerformBlock(runLoop, CFRunLoopMode.commonModes.rawValue) {
+                if let source {
+                    CFRunLoopRemoveSource(runLoop, source, .commonModes)
+                }
+                if let tap {
+                    CFMachPortInvalidate(tap)
+                }
+                CFRunLoopStop(runLoop)
+            }
+            CFRunLoopWakeUp(runLoop)
+        } else if let tap {
             CFMachPortInvalidate(tap)
         }
-        eventTap = nil
     }
 
     private func notifyBackendReset() {
@@ -103,7 +152,10 @@ final class GlobalShortcutBackend {
         switch type {
         case .tapDisabledByTimeout, .tapDisabledByUserInput:
             notifyBackendReset()
-            if let tap = eventTap {
+            eventTapLifecycleLock.lock()
+            let tap = eventTap
+            eventTapLifecycleLock.unlock()
+            if let tap {
                 CGEvent.tapEnable(tap: tap, enable: true)
                 fnKeyIsDown = ModifierKeyEventState.currentFunctionKeyIsDown()
             }

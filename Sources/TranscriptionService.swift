@@ -137,9 +137,8 @@ class TranscriptionService {
         let boundary = UUID().uuidString
         request.setValue("multipart/form-data; boundary=\(boundary)", forHTTPHeaderField: "Content-Type")
 
-        let audioData = try Data(contentsOf: fileURL)
-        let body = makeMultipartBody(
-            audioData: audioData,
+        let multipartFileURL = try makeMultipartBodyFile(
+            audioFileURL: fileURL,
             fileName: fileURL.lastPathComponent,
             model: transcriptionModel,
             responseFormat: transcriptionResponseFormat,
@@ -147,9 +146,12 @@ class TranscriptionService {
             prompt: prompt,
             boundary: boundary
         )
+        defer {
+            try? FileManager.default.removeItem(at: multipartFileURL)
+        }
 
         do {
-            let (data, response) = try await LLMAPITransport.upload(for: request, from: body)
+            let (data, response) = try await LLMAPITransport.upload(for: request, fromFile: multipartFileURL)
             return try validateTranscriptionResponse(data: data, response: response, fileURL: fileURL)
         } catch {
             let nsError = error as NSError
@@ -216,62 +218,79 @@ class TranscriptionService {
         return (attributes?[.size] as? NSNumber)?.int64Value ?? -1
     }
 
-    /// Builds the `multipart/form-data` body for a Whisper transcription
-    /// request, including the model, response format, deterministic
-    /// `temperature=0`, optional language hint, optional biasing prompt, and
-    /// the audio file payload.
-    private func makeMultipartBody(
-        audioData: Data,
+    /// Builds the multipart body on disk instead of in memory. A recorded WAV
+    /// can be many MB; reading it into `Data` and then appending it into a
+    /// second multipart `Data` doubles peak memory during the critical
+    /// transcribe-after-stop path.
+    private func makeMultipartBodyFile(
+        audioFileURL: URL,
         fileName: String,
         model: String,
         responseFormat: String,
         language: String?,
         prompt: String?,
         boundary: String
-    ) -> Data {
-        var body = Data()
+    ) throws -> URL {
+        let outputURL = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString + ".multipart")
+        FileManager.default.createFile(atPath: outputURL.path, contents: nil)
 
-        func append(_ value: String) {
-            body.append(Data(value.utf8))
+        let output = try FileHandle(forWritingTo: outputURL)
+        defer {
+            try? output.close()
         }
 
-        append("--\(boundary)\r\n")
-        append("Content-Disposition: form-data; name=\"model\"\r\n\r\n")
-        append("\(model)\r\n")
+        func append(_ value: String) throws {
+            if let data = value.data(using: .utf8) {
+                try output.write(contentsOf: data)
+            }
+        }
 
-        append("--\(boundary)\r\n")
-        append("Content-Disposition: form-data; name=\"response_format\"\r\n\r\n")
-        append("\(responseFormat)\r\n")
+        try append("--\(boundary)\r\n")
+        try append("Content-Disposition: form-data; name=\"model\"\r\n\r\n")
+        try append("\(model)\r\n")
 
-        // temperature=0 makes Whisper deterministic and greedy, which reduces
-        // the random word substitutions/hallucinations that make dictation feel
-        // like it "didn't transcribe what I said".
-        append("--\(boundary)\r\n")
-        append("Content-Disposition: form-data; name=\"temperature\"\r\n\r\n")
-        append("0\r\n")
+        try append("--\(boundary)\r\n")
+        try append("Content-Disposition: form-data; name=\"response_format\"\r\n\r\n")
+        try append("\(responseFormat)\r\n")
+
+        try append("--\(boundary)\r\n")
+        try append("Content-Disposition: form-data; name=\"temperature\"\r\n\r\n")
+        try append("0\r\n")
 
         if let language, !language.isEmpty {
-            append("--\(boundary)\r\n")
-            append("Content-Disposition: form-data; name=\"language\"\r\n\r\n")
-            append("\(language)\r\n")
+            try append("--\(boundary)\r\n")
+            try append("Content-Disposition: form-data; name=\"language\"\r\n\r\n")
+            try append("\(language)\r\n")
         }
 
-        // Bias Whisper toward the user's custom vocabulary (names, jargon,
-        // acronyms) so domain terms are spelled correctly in the raw transcript.
         if let prompt, !prompt.isEmpty {
-            append("--\(boundary)\r\n")
-            append("Content-Disposition: form-data; name=\"prompt\"\r\n\r\n")
-            append("\(prompt)\r\n")
+            try append("--\(boundary)\r\n")
+            try append("Content-Disposition: form-data; name=\"prompt\"\r\n\r\n")
+            try append("\(prompt)\r\n")
         }
 
-        append("--\(boundary)\r\n")
-        append("Content-Disposition: form-data; name=\"file\"; filename=\"\(fileName)\"\r\n")
-        append("Content-Type: \(audioContentType(for: fileName))\r\n\r\n")
-        body.append(audioData)
-        append("\r\n")
-        append("--\(boundary)--\r\n")
+        try append("--\(boundary)\r\n")
+        try append("Content-Disposition: form-data; name=\"file\"; filename=\"\(fileName)\"\r\n")
+        try append("Content-Type: \(audioContentType(for: fileName))\r\n\r\n")
+        try appendFile(audioFileURL, to: output)
+        try append("\r\n")
+        try append("--\(boundary)--\r\n")
 
-        return body
+        return outputURL
+    }
+
+    private func appendFile(_ sourceURL: URL, to output: FileHandle) throws {
+        let input = try FileHandle(forReadingFrom: sourceURL)
+        defer {
+            try? input.close()
+        }
+
+        while true {
+            let chunk = try input.read(upToCount: 1024 * 1024) ?? Data()
+            guard !chunk.isEmpty else { break }
+            try output.write(contentsOf: chunk)
+        }
     }
 
     /// Map a non-200 HTTP status into a one-line user-readable message.
