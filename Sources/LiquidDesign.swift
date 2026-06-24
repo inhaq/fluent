@@ -134,10 +134,10 @@ struct LiquidProminentButtonStyle: ButtonStyle {
     var tint: Color = .accentColor
 
     func makeBody(configuration: Configuration) -> some View {
-        Body(configuration: configuration, tint: tint)
+        StyleBody(configuration: configuration, tint: tint)
     }
 
-    private struct Body: View {
+    private struct StyleBody: View {
         let configuration: Configuration
         let tint: Color
         @Environment(\.isEnabled) private var isEnabled
