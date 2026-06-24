@@ -38,7 +38,19 @@ public struct ModelConfiguration {
         else if cleanModel == "gpt-oss-20b" { cleanModel = "openai/gpt-oss-20b" }
         else if cleanModel == "gpt-oss-120b" { cleanModel = "openai/gpt-oss-120b" }
         else if cleanModel == "gpt-oss-safeguard-20b" { cleanModel = "openai/gpt-oss-safeguard-20b" }
-        
+
+        // Any Qwen reasoning model emits <think> blocks regardless of exact id
+        // or provider prefix (e.g. "qwen/qwen3-32b", "qwen/qwen3.6-27b"). Match
+        // the whole family so think tags are flagged for stripping.
+        if cleanModel.contains("qwen") {
+            return ModelConfig(
+                maxCompletionTokens: nil,
+                reasoningEffort: nil,
+                includeReasoning: nil,
+                shouldStripThinkTags: true
+            )
+        }
+
         if cleanModel == "openai/gpt-oss-20b" {
             return ModelConfig(
                 maxCompletionTokens: 4096,
@@ -167,23 +179,24 @@ public struct ModelConfiguration {
     /// This also handles unclosed tags gracefully (e.g. if the model runs out of tokens).
     public static func stripThinkTags(_ text: String) -> String {
         var cleaned = text
-        
-        // First, replace fully closed tags: <think>...</think>
-        // We use a group with + to catch multiple consecutive think blocks.
-        let closedRegexPattern = "^(?:\\s*<think>[\\s\\S]*?</think>)+"
-        if let regex = try? NSRegularExpression(pattern: closedRegexPattern, options: []) {
+
+        // Remove one or more leading reasoning blocks: <think>...</think>
+        // (also <thinking>...</thinking>). Case-insensitive and tolerant of
+        // whitespace inside the tags. The "+" catches consecutive blocks.
+        let closedRegexPattern = "^(?:\\s*<\\s*think(?:ing)?\\s*>[\\s\\S]*?<\\s*/\\s*think(?:ing)?\\s*>)+"
+        if let regex = try? NSRegularExpression(pattern: closedRegexPattern, options: [.caseInsensitive]) {
             let range = NSRange(cleaned.startIndex..<cleaned.endIndex, in: cleaned)
             cleaned = regex.stringByReplacingMatches(in: cleaned, options: [], range: range, withTemplate: "")
         }
-        
-        // Next, if there is an unclosed <think> tag remaining (meaning it started thinking but got truncated),
-        // we strip from the opening <think> tag to the very end of the string.
-        let openRegexPattern = "^\\s*<think>[\\s\\S]*$"
-        if let regex = try? NSRegularExpression(pattern: openRegexPattern, options: []) {
+
+        // If a reasoning block opened but never closed (e.g. the model ran out
+        // of tokens mid-thought), strip from the opening tag to the end.
+        let openRegexPattern = "^\\s*<\\s*think(?:ing)?\\s*>[\\s\\S]*$"
+        if let regex = try? NSRegularExpression(pattern: openRegexPattern, options: [.caseInsensitive]) {
             let range = NSRange(cleaned.startIndex..<cleaned.endIndex, in: cleaned)
             cleaned = regex.stringByReplacingMatches(in: cleaned, options: [], range: range, withTemplate: "")
         }
-        
+
         return cleaned.trimmingCharacters(in: .whitespacesAndNewlines)
     }
 }

@@ -434,10 +434,12 @@ Model: \(model)
             throw PostProcessingError.invalidResponse("Missing choices[0].message.content")
         }
         
-        var content = rawContent
-        if config.shouldStripThinkTags {
-            content = ModelConfiguration.stripThinkTags(content)
-        }
+        // Always strip reasoning blocks. Reasoning models (Qwen, DeepSeek-R1,
+        // etc.) emit a leading <think>...</think> block in the message content.
+        // Gating this on a per-model allowlist meant any model not explicitly
+        // listed (e.g. "qwen/qwen3.6-27b") leaked its chain-of-thought into the
+        // pasted output. Stripping is a no-op for models that don't emit tags.
+        let content = ModelConfiguration.stripThinkTags(rawContent)
 
         guard !content.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
             throw PostProcessingError.emptyOutput
@@ -565,10 +567,8 @@ Model: \(model)
             throw PostProcessingError.invalidResponse("Missing choices[0].message.content")
         }
         
-        var content = rawContent
-        if config.shouldStripThinkTags {
-            content = ModelConfiguration.stripThinkTags(content)
-        }
+        // Always strip reasoning blocks (see note in process()).
+        let content = ModelConfiguration.stripThinkTags(rawContent)
 
         guard !content.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
             throw PostProcessingError.emptyOutput

@@ -282,7 +282,7 @@ Selected text: \(selectedText ?? "None")
                 return nil
             }
 
-            let cleaned = content.trimmingCharacters(in: .whitespacesAndNewlines)
+            let cleaned = ModelConfiguration.stripThinkTags(content)
             guard !cleaned.isEmpty else { return nil }
             return (activity: normalizedActivitySummary(cleaned), prompt: fullPrompt)
         } catch {
