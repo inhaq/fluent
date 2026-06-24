@@ -343,19 +343,32 @@ class TranscriptionService {
         return normalizedURL
     }
 
-    // Whisper-large-v3 hallucinates common short phrases on silence/background
-    // noise. Drop them ONLY when whisper itself is highly confident the clip
-    // contains no speech. Add a new phrase here to filter more hallucinations.
+    // MARK: Robust transcript filtering (Whisper paper, §4.5 "Decoding")
     //
-    // IMPORTANT: this filter must never eat real speech. A user genuinely
-    // saying "thank you" or "you" is common, and Whisper routinely reports a
-    // moderate no_speech_prob (0.1-0.5) on such short, real utterances. The
-    // previous 0.1 threshold therefore silently discarded legitimate dictation.
-    // We now require a very high no_speech_prob (>= 0.8) AND evaluate the
-    // minimum across all segments, so a single clearly-spoken segment keeps the
-    // transcript. This keeps the silence/noise hallucination guard while
-    // strongly favoring not dropping what the user actually said.
-    private let hallucinationPhrases = [
+    // Whisper ("Robust Speech Recognition via Large-Scale Weak Supervision")
+    // is an encoder–decoder transformer trained with weak supervision; its
+    // characteristic failure mode is hallucinating text on silent/low-speech
+    // audio. The paper's robust-decoding heuristics identify a failed /
+    // non-speech segment from three per-segment signals that the provider
+    // returns in verbose_json:
+    //   - no_speech_prob   : probability the segment contains no speech
+    //   - avg_logprob      : mean token log-probability (model confidence)
+    //   - compression_ratio: gzip ratio of the text (high => repetitive/looped)
+    //
+    // Applying the paper's defaults (no_speech > 0.6, avg_logprob < -1.0,
+    // compression_ratio > 2.4) drops hallucinated segments while preserving
+    // genuine — even quiet, lower-confidence — speech. This generalizes far
+    // beyond a hardcoded phrase list: a hallucination is caught by its
+    // statistics, and a real utterance (speech detected, reasonable confidence,
+    // low repetition) is kept regardless of the exact words.
+    private let noSpeechThreshold = 0.6
+    private let logProbThreshold = -1.0
+    private let compressionRatioThreshold = 2.4
+
+    // Secondary net for phrases Whisper notoriously emits on silence. Only used
+    // to drop a segment that ALSO looks non-speech (moderate no_speech_prob),
+    // so a genuine "thank you" / "you" is never discarded.
+    private let hallucinationPhrases: Set<String> = [
         "thank you",
         "thank you for watching",
         "thank you very much",
@@ -368,18 +381,26 @@ class TranscriptionService {
         "you"
     ]
 
-    private let hallucinationNoSpeechThreshold = 0.8
+    private struct WhisperSegment {
+        let text: String
+        let avgLogprob: Double
+        let compressionRatio: Double
+        let noSpeechProb: Double
+    }
 
-    /// Parses the transcript text from a provider response. JSON responses are
-    /// decoded and run through the hallucination filter; plain-text responses
-    /// are normalized into a single trimmed string.
+    /// Parses the transcript from a provider response. For `verbose_json` with
+    /// segments we apply the Whisper paper's robust-decoding heuristics to drop
+    /// hallucinated/non-speech segments; otherwise we fall back to the raw text.
     private func parseTranscript(from data: Data) throws -> String {
-        if let json = try JSONSerialization.jsonObject(with: data) as? [String: Any],
-           let text = json["text"] as? String {
-            if isHallucination(text: text, json: json) {
-                return ""
+        if let json = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any] {
+            if let segments = json["segments"] as? [[String: Any]], !segments.isEmpty {
+                return filteredTranscript(fromSegments: segments)
             }
-            return text
+            if let text = json["text"] as? String {
+                // No per-segment metadata available: return the text unfiltered
+                // rather than risk dropping real speech with a blunt phrase match.
+                return text.trimmingCharacters(in: .whitespacesAndNewlines)
+            }
         }
 
         let plainText = String(data: data, encoding: .utf8) ?? ""
@@ -394,45 +415,55 @@ class TranscriptionService {
         return text
     }
 
-    /// Determines whether a transcript is a Whisper silence/noise
-    /// hallucination. Returns `true` only when the text matches a known
-    /// hallucinated phrase and the minimum `no_speech_prob` across all segments
-    /// meets ``hallucinationNoSpeechThreshold`` (i.e. Whisper is highly
-    /// confident the clip contains no speech).
-    private func isHallucination(text: String, json: [String: Any]) -> Bool {
-        let normalized = text
+    /// Rebuilds the transcript from Whisper segments, discarding those the
+    /// paper's heuristics flag as hallucination / non-speech. Segments missing
+    /// metrics are treated as speech (kept) so we never over-filter.
+    private func filteredTranscript(fromSegments rawSegments: [[String: Any]]) -> String {
+        let segments = rawSegments.map { segment in
+            WhisperSegment(
+                text: segment["text"] as? String ?? "",
+                avgLogprob: segment["avg_logprob"] as? Double ?? 0,
+                compressionRatio: segment["compression_ratio"] as? Double ?? 0,
+                noSpeechProb: segment["no_speech_prob"] as? Double ?? 0
+            )
+        }
+
+        let kept = segments.filter { !isHallucinatedSegment($0) }
+        // Whisper doesn't guarantee each segment's text carries its own leading
+        // space, so trim each one and join with a single space to avoid merging
+        // words across segment boundaries (and to collapse incidental padding).
+        let rebuilt = kept
+            .map { $0.text.trimmingCharacters(in: .whitespacesAndNewlines) }
+            .filter { !$0.isEmpty }
+            .joined(separator: " ")
+        return rebuilt.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    /// Applies the Whisper paper's robust-decoding signals to decide whether a
+    /// single segment is a hallucination / non-speech and should be dropped.
+    private func isHallucinatedSegment(_ segment: WhisperSegment) -> Bool {
+        // Paper's non-speech rule: confidently non-speech AND low confidence.
+        if segment.noSpeechProb > noSpeechThreshold && segment.avgLogprob < logProbThreshold {
+            return true
+        }
+
+        // Repetition/looping hallucination: a high gzip ratio with low model
+        // confidence. (The provider already does the paper's temperature
+        // fallback, so a still-high compression ratio signals real gibberish.)
+        if segment.compressionRatio > compressionRatioThreshold && segment.avgLogprob < -0.5 {
+            return true
+        }
+
+        // Secondary phrase net for the classic silence hallucinations, gated on
+        // a moderate no_speech_prob so genuine short utterances survive.
+        let normalized = segment.text
             .lowercased()
             .trimmingCharacters(in: CharacterSet.punctuationCharacters.union(.whitespacesAndNewlines))
-        guard hallucinationPhrases.contains(normalized) else {
-            return false
+        if hallucinationPhrases.contains(normalized) && segment.noSpeechProb > 0.5 {
+            return true
         }
 
-        guard let segments = json["segments"] as? [[String: Any]] else {
-            os_log(
-                .info,
-                log: transcriptionLog,
-                "Skipping hallucination filter for '%{public}@': provider response has no segments/no_speech metadata",
-                normalized
-            )
-            return false
-        }
-
-        // Evaluate the *minimum* no_speech_prob across every segment. If any
-        // segment is confidently speech (low no_speech_prob), the clip contains
-        // real audio and must not be discarded — even if other segments look
-        // silent. Only when the entire clip is confidently non-speech do we
-        // treat the phrase as a hallucination.
-        let noSpeechProbs = segments.compactMap { $0["no_speech_prob"] as? Double }
-        guard let minNoSpeechProb = noSpeechProbs.min() else {
-            os_log(
-                .info,
-                log: transcriptionLog,
-                "Skipping hallucination filter for '%{public}@': provider response omitted no_speech_prob",
-                normalized
-            )
-            return false
-        }
-        return minNoSpeechProb >= hallucinationNoSpeechThreshold
+        return false
     }
 }
 

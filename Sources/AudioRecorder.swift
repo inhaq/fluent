@@ -553,6 +553,10 @@ final class AudioRecorder: NSObject, ObservableObject, AVCaptureAudioDataOutputS
                 return existing
             }
             let new = AVAudioConverter(from: sourceFormat, to: targetFormat)
+            // Use the highest-quality sample-rate conversion so downsampling a
+            // 44.1/48 kHz mic to Whisper's 16 kHz does not introduce aliasing
+            // artifacts that degrade word recognition.
+            new?.sampleRateConverterQuality = .max
             existing = new
             return new
         }
@@ -764,6 +768,136 @@ final class AudioRecorder: NSObject, ObservableObject, AVCaptureAudioDataOutputS
         }
     }
 
+    /// Enhances a recorded PCM WAV for speech recognition and writes the result
+    /// to a new temporary WAV. Two stages are applied:
+    ///
+    /// 1. An 80 Hz first-order high-pass filter that removes DC offset and
+    ///    sub-speech rumble (HVAC, mic handling, desk thumps). Whisper's mel
+    ///    front-end is robust to absolute loudness but sensitive to SNR, so
+    ///    stripping low-frequency energy outside the speech band raises the
+    ///    effective SNR of quiet/soft speech and improves word recognition.
+    /// 2. Loudness normalization toward a consistent target RMS, with a peak
+    ///    ceiling and a capped makeup gain, so faint dictation reaches the model
+    ///    at a predictable level. It never attenuates.
+    ///
+    /// The operation is intentionally conservative and self-healing:
+    /// - Silent clips (RMS below ``silenceRMSFloor``) are skipped so we never
+    ///   amplify the noise floor.
+    /// - Makeup gain is capped (``maxMakeupGain``) and limited so the peak can
+    ///   never exceed ``peakCeiling``. If the high-passed signal already
+    ///   overshoots the ceiling, enhancement is abandoned (returns `nil`) so the
+    ///   caller uploads the original rather than a clipped version. A final
+    ///   hard clip to [-1, 1] only guards the float-to-Int16 write.
+    /// - Any failure returns `nil`.
+    ///
+    /// - Returns: A new temporary WAV URL the caller should upload (and delete
+    ///   afterward), or `nil` when enhancement was skipped or failed — in which
+    ///   case the caller must upload the original file unchanged.
+    static func enhancedWAV(at sourceURL: URL) -> URL? {
+        let targetRMS: Float = 0.125      // ~ -18 dBFS, a comfortable speech level
+        let peakCeiling: Float = 0.97     // ~ -0.26 dBFS, leaves headroom
+        let maxMakeupGain: Float = 11.0   // ~ +21 dB cap so we don't blow up noise
+        let silenceRMSFloor: Float = 0.0009
+        let highPassCutoffHz: Float = 80  // below the speech fundamental range
+
+        do {
+            let inputFile = try AVAudioFile(forReading: sourceURL)
+            let format = inputFile.processingFormat
+            let frameCount = AVAudioFrameCount(inputFile.length)
+            guard frameCount > 0,
+                  let buffer = AVAudioPCMBuffer(pcmFormat: format, frameCapacity: frameCount) else {
+                return nil
+            }
+            try inputFile.read(into: buffer)
+
+            let frames = Int(buffer.frameLength)
+            let channelCount = Int(format.channelCount)
+            guard frames > 0, channelCount > 0, let channels = buffer.floatChannelData else {
+                return nil
+            }
+
+            // Skip pure silence so we never high-pass/amplify the noise floor.
+            var preSummedMeanSquare: Float = 0
+            for channel in 0..<channelCount {
+                var meanSquare: Float = 0
+                vDSP_measqv(channels[channel], 1, &meanSquare, vDSP_Length(frames))
+                preSummedMeanSquare += meanSquare
+            }
+            guard sqrt(preSummedMeanSquare / Float(channelCount)) > silenceRMSFloor else {
+                return nil
+            }
+
+            // --- Stage 1: first-order high-pass (in place, per channel) ---
+            // y[n] = alpha * (y[n-1] + x[n] - x[n-1])
+            let sampleRate = Float(format.sampleRate)
+            let rc = 1 / (2 * Float.pi * highPassCutoffHz)
+            let dt = 1 / sampleRate
+            let alpha = rc / (rc + dt)
+            for channel in 0..<channelCount {
+                let samples = channels[channel]
+                var previousInput = samples[0]
+                var previousOutput: Float = 0
+                for index in 0..<frames {
+                    let input = samples[index]
+                    let output = alpha * (previousOutput + input - previousInput)
+                    samples[index] = output
+                    previousInput = input
+                    previousOutput = output
+                }
+            }
+
+            // --- Stage 2: measure post-filter loudness/peak, apply safe gain ---
+            var summedMeanSquare: Float = 0
+            var peak: Float = 0
+            for channel in 0..<channelCount {
+                var meanSquare: Float = 0
+                vDSP_measqv(channels[channel], 1, &meanSquare, vDSP_Length(frames))
+                summedMeanSquare += meanSquare
+                var channelPeak: Float = 0
+                vDSP_maxmgv(channels[channel], 1, &channelPeak, vDSP_Length(frames))
+                peak = max(peak, channelPeak)
+            }
+            let rms = sqrt(summedMeanSquare / Float(channelCount))
+            guard rms > 0, peak > 0 else { return nil }
+
+            // Target the desired RMS, but never amplify beyond the cap and
+            // never let the loudest sample exceed the ceiling. If the
+            // high-passed signal already overshoots the ceiling, bail out so
+            // the caller uploads the untouched original rather than a clipped
+            // version.
+            let peakLimitedGain = peakCeiling / peak
+            guard peakLimitedGain >= 1 else {
+                return nil
+            }
+            // Never attenuate (floor at 1), and keep the peak under the ceiling.
+            let desiredGain = max(targetRMS / rms, 1)
+            let gain = min(desiredGain, maxMakeupGain, peakLimitedGain)
+
+            if gain != 1 {
+                for channel in 0..<channelCount {
+                    var scalar = gain
+                    vDSP_vsmul(channels[channel], 1, &scalar, channels[channel], 1, vDSP_Length(frames))
+                }
+            }
+
+            // Hard safety clip so the float -> Int16 file write can never wrap.
+            var low: Float = -1
+            var high: Float = 1
+            for channel in 0..<channelCount {
+                vDSP_vclip(channels[channel], 1, &low, &high, channels[channel], 1, vDSP_Length(frames))
+            }
+
+            let outputURL = FileManager.default.temporaryDirectory
+                .appendingPathComponent(UUID().uuidString + ".wav")
+            let outputFile = try AVAudioFile(forWriting: outputURL, settings: inputFile.fileFormat.settings)
+            try outputFile.write(from: buffer)
+            return outputURL
+        } catch {
+            os_log(.info, log: recordingLog, "audio enhancement skipped: %{public}@", error.localizedDescription)
+            return nil
+        }
+    }
+
     private func updateAudioLevel(from inputBuffer: AVAudioPCMBuffer) -> Float {
         let rms = rmsLevel(for: inputBuffer)
         let normalizedDisplayLevel = liveLevelNormalizerLock.withLock {
@@ -858,6 +992,7 @@ final class AudioRecorder: NSObject, ObservableObject, AVCaptureAudioDataOutputS
                 return existing
             }
             let new = AVAudioConverter(from: sourceFormat, to: pcm16TargetFormat)
+            new?.sampleRateConverterQuality = .max
             existing = new
             return new
         }

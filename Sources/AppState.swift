@@ -2636,6 +2636,21 @@ final class AppState: ObservableObject, @unchecked Sendable {
         fileService: TranscriptionService,
         fileURL: URL
     ) async throws -> String {
+        // Enhance the recording before upload (high-pass to lift SNR of quiet
+        // speech, then loudness-normalize) so faint dictation reaches Whisper
+        // clearly. This is deferred to the file-upload path so realtime
+        // sessions don't pay the enhancement cost when they never upload.
+        // Falls back to the original file if enhancement is skipped or fails.
+        func transcribeEnhancedFile() async throws -> String {
+            let uploadFileURL = AudioRecorder.enhancedWAV(at: fileURL) ?? fileURL
+            defer {
+                if uploadFileURL != fileURL {
+                    try? FileManager.default.removeItem(at: uploadFileURL)
+                }
+            }
+            return try await fileService.transcribe(fileURL: uploadFileURL)
+        }
+
         if let realtimeService {
             do {
                 try Task.checkCancellation()
@@ -2648,10 +2663,10 @@ final class AppState: ObservableObject, @unchecked Sendable {
                 throw CancellationError()
             } catch {
                 try Task.checkCancellation()
-                return try await fileService.transcribe(fileURL: fileURL)
+                return try await transcribeEnhancedFile()
             }
         }
-        return try await fileService.transcribe(fileURL: fileURL)
+        return try await transcribeEnhancedFile()
     }
 
     private func stopAndTranscribe() {
