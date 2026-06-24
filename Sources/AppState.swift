@@ -638,6 +638,10 @@ final class AppState: ObservableObject, @unchecked Sendable {
     private var audioDeviceObservers: [NSObjectProtocol] = []
     private var needsMicrophoneRefreshAfterRecording = false
     private let pipelineHistoryStore = PipelineHistoryStore()
+    /// Bumped by every local mutation of `pipelineHistory`. Lets the initial
+    /// async load detect that it raced a mutation and avoid clobbering newer
+    /// in-memory state.
+    private var pipelineHistoryMutationGeneration = 0
     private let shortcutSessionController = DictationShortcutSessionController()
     private var activeRecordingTriggerMode: RecordingTriggerMode?
     private var currentSessionIntent: SessionIntent = .dictation
@@ -854,8 +858,17 @@ final class AppState: ObservableObject, @unchecked Sendable {
     /// once available. Keeps the (potentially multi-MB) base64 screenshot
     /// payloads from blocking app launch.
     private func loadPipelineHistoryAsync() {
+        let generation = pipelineHistoryMutationGeneration
         pipelineHistoryStore.loadAllHistoryAsync { [weak self] items in
-            self?.pipelineHistory = items
+            guard let self else { return }
+            if self.pipelineHistoryMutationGeneration == generation {
+                self.pipelineHistory = items
+            } else {
+                // A local mutation (record/retry/delete/clear) raced the initial
+                // load. Re-fetch the latest persisted state instead of
+                // overwriting the newer in-memory entries with a stale snapshot.
+                self.loadPipelineHistoryAsync()
+            }
         }
     }
 
@@ -1162,6 +1175,7 @@ final class AppState: ObservableObject, @unchecked Sendable {
             for audioFileName in removedAudioFileNames {
                 Self.deleteAudioFile(audioFileName)
             }
+            pipelineHistoryMutationGeneration += 1
             pipelineHistory = []
         } catch {
             errorMessage = "Unable to clear run history: \(error.localizedDescription)"
@@ -1174,6 +1188,7 @@ final class AppState: ObservableObject, @unchecked Sendable {
             if let audioFileName = try pipelineHistoryStore.delete(id: id) {
                 Self.deleteAudioFile(audioFileName)
             }
+            pipelineHistoryMutationGeneration += 1
             pipelineHistory.remove(at: index)
         } catch {
             errorMessage = "Unable to delete run history entry: \(error.localizedDescription)"
@@ -1276,6 +1291,7 @@ final class AppState: ObservableObject, @unchecked Sendable {
                     )
                     do {
                         try pipelineHistoryStore.update(updatedItem)
+                        pipelineHistoryMutationGeneration += 1
                         if let idx = pipelineHistory.firstIndex(where: { $0.id == updatedItem.id }) {
                             pipelineHistory[idx] = updatedItem
                         }
@@ -1317,6 +1333,7 @@ final class AppState: ObservableObject, @unchecked Sendable {
                     )
                     do {
                         try pipelineHistoryStore.update(updatedItem)
+                        pipelineHistoryMutationGeneration += 1
                         if let idx = pipelineHistory.firstIndex(where: { $0.id == updatedItem.id }) {
                             pipelineHistory[idx] = updatedItem
                         }
@@ -1475,7 +1492,13 @@ final class AppState: ObservableObject, @unchecked Sendable {
         DispatchQueue.global(qos: .utility).async { [weak self] in
             let devices = AudioDevice.availableInputDevices()
             DispatchQueue.main.async {
-                guard let self, !self.isRecording, !self.audioRecorder.isRecording else { return }
+                guard let self else { return }
+                guard !self.isRecording, !self.audioRecorder.isRecording else {
+                    // Recording started while discovery was in flight — defer
+                    // so the list refreshes once recording ends.
+                    self.needsMicrophoneRefreshAfterRecording = true
+                    return
+                }
                 self.availableMicrophones = devices
             }
         }
@@ -2924,6 +2947,7 @@ final class AppState: ObservableObject, @unchecked Sendable {
             // Update the in-memory list in place rather than reloading the
             // entire store (which would re-read every base64 screenshot blob
             // from disk on each dictation). Newest entries sort to the front.
+            pipelineHistoryMutationGeneration += 1
             pipelineHistory.insert(newEntry, at: 0)
             if pipelineHistory.count > maxPipelineHistoryCount {
                 pipelineHistory.removeLast(pipelineHistory.count - maxPipelineHistoryCount)

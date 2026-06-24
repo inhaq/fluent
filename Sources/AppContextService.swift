@@ -741,7 +741,12 @@ Selected text: \(selectedText ?? "None")
             y: floor(CGFloat(minY) * scaleY),
             width: ceil(CGFloat(maxX - minX + 1) * scaleX),
             height: ceil(CGFloat(maxY - minY + 1) * scaleY)
-        ).intersection(CGRect(x: 0, y: 0, width: originalWidth, height: originalHeight))
+        ).intersection(CGRect(
+            x: 0,
+            y: 0,
+            width: CGFloat(originalWidth),
+            height: CGFloat(originalHeight)
+        ))
 
         guard !cropRect.isNull, cropRect.width > 0, cropRect.height > 0 else { return image }
 
