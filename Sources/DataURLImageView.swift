@@ -33,6 +33,16 @@ func base64PayloadByteCount(forDataURL dataURL: String) -> Int? {
     return (length / 4) * 3 - padding
 }
 
+/// Decodes the base64 payload of a `data:` URL into raw `Data` (e.g. PNG/JPEG
+/// bytes). Returns `nil` if the URL has no payload or the base64 is invalid.
+/// `Data` is `Sendable`, so this is safe to run inside a detached task and
+/// hand back across a concurrency boundary (unlike `NSImage` on macOS 13).
+func base64ImageData(fromDataURL dataURL: String) -> Data? {
+    guard let commaIndex = dataURL.lastIndex(of: ",") else { return nil }
+    let base64 = String(dataURL[dataURL.index(after: commaIndex)...])
+    return Data(base64Encoded: base64, options: .ignoreUnknownCharacters)
+}
+
 /// Loads an `NSImage` from a base64 `data:` URL off the main thread and caches
 /// the result. Centralizes the decode so the UI never blocks the main thread
 /// decoding screenshots (the cause of stalls when opening the Run Log / Debug
@@ -63,13 +73,20 @@ final class DataURLImageLoader: ObservableObject {
         image = nil
         loadedKey = nil
 
-        let decoded = await Task.detached(priority: .userInitiated) {
-            imageFromDataURL(dataURL)
+        // Do the expensive base64 decode off the main thread. We transfer the raw
+        // `Data` (which is `Sendable`) back and build the `NSImage` on the main
+        // actor: `NSImage(data:)` is cheap/lazy, while the base64 decode of a
+        // hundreds-of-KB screenshot is the work we want off the main thread.
+        // (`NSImage` only conforms to `Sendable` on macOS 14+, so we avoid
+        // returning it across the concurrency boundary on the macOS 13 target.)
+        let decodedData = await Task.detached(priority: .userInitiated) {
+            base64ImageData(fromDataURL: dataURL)
         }.value
 
         // Guard against the dataURL changing while we were decoding.
         guard !Task.isCancelled else { return }
 
+        let decoded = decodedData.flatMap { NSImage(data: $0) }
         if let decoded {
             DataURLImageCache.shared.store(decoded, forKey: dataURL)
         }
