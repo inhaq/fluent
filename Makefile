@@ -93,7 +93,11 @@ dmg: all
 	@cp -R "$(APP_BUNDLE)" $(BUILD_DIR)/dmg-staging/
 	@osascript -e 'tell application "Finder" to make alias file to POSIX file "/Applications" at POSIX file "'"$$(cd $(BUILD_DIR)/dmg-staging && pwd)"'"'
 	@ALIAS=$$(find $(BUILD_DIR)/dmg-staging -maxdepth 1 -not -name '*.app' -not -name '.DS_Store' -type f | head -1) && mv "$$ALIAS" "$(BUILD_DIR)/dmg-staging/Applications"
-	@fileicon set "$(BUILD_DIR)/dmg-staging/Applications" /System/Library/CoreServices/CoreTypes.bundle/Contents/Resources/ApplicationsFolderIcon.icns
+	@if command -v fileicon >/dev/null 2>&1; then \
+		fileicon set "$(BUILD_DIR)/dmg-staging/Applications" /System/Library/CoreServices/CoreTypes.bundle/Contents/Resources/ApplicationsFolderIcon.icns; \
+	else \
+		echo "warning: 'fileicon' not found in PATH — skipping the custom Applications folder icon (cosmetic only). Install it with 'brew install fileicon' to restore it."; \
+	fi
 	@echo "Creating DMG..."
 	@create-dmg \
 		--volname "$(APP_NAME)" \
