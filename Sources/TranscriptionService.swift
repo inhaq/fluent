@@ -8,6 +8,11 @@ class TranscriptionService {
     private let baseURL: URL
     private let transcriptionModel: String
     private let language: String?
+    /// Optional biasing prompt sent to Whisper. Whisper uses this as a hint for
+    /// spelling and rare/domain terms (names, jargon, acronyms), which sharply
+    /// improves accuracy on the user's custom vocabulary. Capped to Whisper's
+    /// ~224-token context window (see `init`).
+    private let prompt: String?
     private let transcriptionResponseFormat = "verbose_json"
     private var transcriptionTimeoutSeconds: TimeInterval {
         let override = UserDefaults.standard.double(forKey: "transcription_timeout_seconds")
@@ -18,7 +23,8 @@ class TranscriptionService {
         apiKey: String,
         baseURL: String = "https://api.groq.com/openai/v1",
         transcriptionModel: String = "whisper-large-v3",
-        language: String? = nil
+        language: String? = nil,
+        prompt: String? = nil
     ) throws {
         self.apiKey = apiKey
         self.baseURL = try Self.normalizedBaseURL(from: baseURL)
@@ -26,6 +32,14 @@ class TranscriptionService {
         self.transcriptionModel = trimmedModel.isEmpty ? "whisper-large-v3" : trimmedModel
         let trimmedLanguage = language?.trimmingCharacters(in: .whitespacesAndNewlines)
         self.language = (trimmedLanguage?.isEmpty == false) ? trimmedLanguage : nil
+        // Whisper's prompt window is ~224 tokens. Trim to a safe character
+        // budget so a large vocabulary list never overflows or gets rejected.
+        let trimmedPrompt = prompt?.trimmingCharacters(in: .whitespacesAndNewlines)
+        if let trimmedPrompt, !trimmedPrompt.isEmpty {
+            self.prompt = String(trimmedPrompt.prefix(800))
+        } else {
+            self.prompt = nil
+        }
     }
 
     // Validate API key by hitting a lightweight endpoint
@@ -115,6 +129,7 @@ class TranscriptionService {
             model: transcriptionModel,
             responseFormat: transcriptionResponseFormat,
             language: language,
+            prompt: prompt,
             boundary: boundary
         )
 
@@ -185,6 +200,7 @@ class TranscriptionService {
         model: String,
         responseFormat: String,
         language: String?,
+        prompt: String?,
         boundary: String
     ) -> Data {
         var body = Data()
@@ -201,10 +217,25 @@ class TranscriptionService {
         append("Content-Disposition: form-data; name=\"response_format\"\r\n\r\n")
         append("\(responseFormat)\r\n")
 
+        // temperature=0 makes Whisper deterministic and greedy, which reduces
+        // the random word substitutions/hallucinations that make dictation feel
+        // like it "didn't transcribe what I said".
+        append("--\(boundary)\r\n")
+        append("Content-Disposition: form-data; name=\"temperature\"\r\n\r\n")
+        append("0\r\n")
+
         if let language, !language.isEmpty {
             append("--\(boundary)\r\n")
             append("Content-Disposition: form-data; name=\"language\"\r\n\r\n")
             append("\(language)\r\n")
+        }
+
+        // Bias Whisper toward the user's custom vocabulary (names, jargon,
+        // acronyms) so domain terms are spelled correctly in the raw transcript.
+        if let prompt, !prompt.isEmpty {
+            append("--\(boundary)\r\n")
+            append("Content-Disposition: form-data; name=\"prompt\"\r\n\r\n")
+            append("\(prompt)\r\n")
         }
 
         append("--\(boundary)\r\n")
@@ -287,13 +318,17 @@ class TranscriptionService {
     }
 
     // Whisper-large-v3 hallucinates common short phrases on silence/background
-    // noise. Drop them when whisper itself reports a high no_speech_prob.
-    // Add a new (phrase, minNoSpeechProb) pair here to filter more hallucinations.
+    // noise. Drop them ONLY when whisper itself is highly confident the clip
+    // contains no speech. Add a new phrase here to filter more hallucinations.
     //
-    // Thresholds tuned on ~500 samples from quiet and noisy environments, including
-    // both positive cases (real "thank you" speech) and empty-audio cases. Kept
-    // conservative to minimize false positives (filtering real user speech).
-    // Normal speech included audios have very low no_speech_prob.
+    // IMPORTANT: this filter must never eat real speech. A user genuinely
+    // saying "thank you" or "you" is common, and Whisper routinely reports a
+    // moderate no_speech_prob (0.1-0.5) on such short, real utterances. The
+    // previous 0.1 threshold therefore silently discarded legitimate dictation.
+    // We now require a very high no_speech_prob (>= 0.8) AND evaluate the
+    // minimum across all segments, so a single clearly-spoken segment keeps the
+    // transcript. This keeps the silence/noise hallucination guard while
+    // strongly favoring not dropping what the user actually said.
     private let hallucinationPhrases = [
         "thank you",
         "thank you for watching",
@@ -307,7 +342,7 @@ class TranscriptionService {
         "you"
     ]
 
-    private let hallucinationNoSpeechThreshold = 0.1
+    private let hallucinationNoSpeechThreshold = 0.8
 
     private func parseTranscript(from data: Data) throws -> String {
         if let json = try JSONSerialization.jsonObject(with: data) as? [String: Any],
@@ -348,7 +383,13 @@ class TranscriptionService {
             return false
         }
 
-        guard let noSpeechProb = segments.first?["no_speech_prob"] as? Double else {
+        // Evaluate the *minimum* no_speech_prob across every segment. If any
+        // segment is confidently speech (low no_speech_prob), the clip contains
+        // real audio and must not be discarded — even if other segments look
+        // silent. Only when the entire clip is confidently non-speech do we
+        // treat the phrase as a hallucination.
+        let noSpeechProbs = segments.compactMap { $0["no_speech_prob"] as? Double }
+        guard let minNoSpeechProb = noSpeechProbs.min() else {
             os_log(
                 .info,
                 log: transcriptionLog,
@@ -357,7 +398,7 @@ class TranscriptionService {
             )
             return false
         }
-        return noSpeechProb >= hallucinationNoSpeechThreshold
+        return minNoSpeechProb >= hallucinationNoSpeechThreshold
     }
 }
 
