@@ -23,10 +23,7 @@ import SwiftUI
 /// soft shadow — the building block for the modernized UI.
 struct LiquidSurfaceModifier: ViewModifier {
     var cornerRadius: CGFloat = 14
-    var material: Material = .regularMaterial
     var strokeOpacity: Double = 1.0
-    var shadowRadius: CGFloat = 8
-    var shadowY: CGFloat = 4
 
     @ViewBuilder
     func body(content: Content) -> some View {
@@ -36,23 +33,22 @@ struct LiquidSurfaceModifier: ViewModifier {
             // clips to the shape, so no extra material/stroke/shadow is added.
             content.glassEffect(.regular, in: shape)
         } else {
+            // macOS 13–25 fallback. Deliberately cheap: the Settings screens
+            // stack ~15+ of these surfaces, and a live `Material`
+            // (NSVisualEffectView backdrop blur) plus a per-card drop shadow
+            // made switching tabs janky (each tab switch had to spin up a dozen+
+            // blur views and offscreen shadow passes). A flat, adaptive fill and
+            // a hairline stroke keep the card look at a fraction of the cost,
+            // with no NSVisualEffectView and no offscreen shadow rendering.
             content
-                .background(shape.fill(material))
+                .background(shape.fill(Color(nsColor: .controlBackgroundColor)))
                 .overlay(
                     shape.strokeBorder(
-                        LinearGradient(
-                            colors: [
-                                Color.white.opacity(0.18 * strokeOpacity),
-                                Color.white.opacity(0.04 * strokeOpacity)
-                            ],
-                            startPoint: .top,
-                            endPoint: .bottom
-                        ),
+                        Color.primary.opacity(0.08 * strokeOpacity),
                         lineWidth: 1
                     )
                 )
                 .clipShape(shape)
-                .shadow(color: Color.black.opacity(0.12), radius: shadowRadius, x: 0, y: shadowY)
         }
     }
 }
@@ -61,18 +57,12 @@ extension View {
     /// Applies the standard translucent "liquid" surface treatment.
     func liquidSurface(
         cornerRadius: CGFloat = 14,
-        material: Material = .regularMaterial,
-        strokeOpacity: Double = 1.0,
-        shadowRadius: CGFloat = 8,
-        shadowY: CGFloat = 4
+        strokeOpacity: Double = 1.0
     ) -> some View {
         modifier(
             LiquidSurfaceModifier(
                 cornerRadius: cornerRadius,
-                material: material,
-                strokeOpacity: strokeOpacity,
-                shadowRadius: shadowRadius,
-                shadowY: shadowY
+                strokeOpacity: strokeOpacity
             )
         )
     }
