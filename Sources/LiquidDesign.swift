@@ -99,21 +99,32 @@ struct LiquidProminentButtonStyle: ButtonStyle {
     var tint: Color = .accentColor
 
     func makeBody(configuration: Configuration) -> some View {
-        configuration.label
-            .font(.body.weight(.semibold))
-            .padding(.horizontal, 16)
-            .padding(.vertical, 8)
-            .background(
-                Capsule(style: .continuous)
-                    .fill(tint.opacity(configuration.isPressed ? 0.8 : 1.0))
-            )
-            .foregroundStyle(.white)
-            .overlay(
-                Capsule(style: .continuous)
-                    .strokeBorder(Color.white.opacity(0.18), lineWidth: 1)
-            )
-            .scaleEffect(configuration.isPressed ? 0.97 : 1.0)
-            .animation(.easeOut(duration: 0.12), value: configuration.isPressed)
+        Body(configuration: configuration, tint: tint)
+    }
+
+    private struct Body: View {
+        let configuration: Configuration
+        let tint: Color
+        @Environment(\.isEnabled) private var isEnabled
+
+        var body: some View {
+            configuration.label
+                .font(.body.weight(.semibold))
+                .padding(.horizontal, 16)
+                .padding(.vertical, 8)
+                .background(
+                    Capsule(style: .continuous)
+                        .fill(tint.opacity(configuration.isPressed ? 0.8 : 1.0))
+                )
+                .foregroundStyle(.white)
+                .overlay(
+                    Capsule(style: .continuous)
+                        .strokeBorder(Color.white.opacity(0.18), lineWidth: 1)
+                )
+                .opacity(isEnabled ? 1.0 : 0.45)
+                .scaleEffect(configuration.isPressed ? 0.97 : 1.0)
+                .animation(.easeOut(duration: 0.12), value: configuration.isPressed)
+        }
     }
 }
 

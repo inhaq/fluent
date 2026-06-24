@@ -146,12 +146,14 @@ struct SetupView: View {
                                     validateAndContinue()
                                 }
                                 .keyboardShortcut(.defaultAction)
+                                .buttonStyle(.liquidProminent)
                                 .disabled(apiKeyInput.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || isValidatingKey)
                             } else if currentStep == .vocabulary {
                                 Button("Continue") {
                                     saveCustomVocabularyAndContinue()
                                 }
                                 .keyboardShortcut(.defaultAction)
+                                .buttonStyle(.liquidProminent)
                             } else if currentStep == .testTranscription {
                                 HStack(spacing: 10) {
                                     Button("Skip") {
@@ -170,6 +172,7 @@ struct SetupView: View {
                                         }
                                     }
                                     .keyboardShortcut(.defaultAction)
+                                    .buttonStyle(.liquidProminent)
                                     .disabled(testPhase != .done || testTranscript.isEmpty || testError != nil)
                                 }
                             } else {
@@ -179,6 +182,7 @@ struct SetupView: View {
                                     }
                                 }
                                 .keyboardShortcut(.defaultAction)
+                                .buttonStyle(.liquidProminent)
                                 .disabled(!canContinueFromCurrentStep)
                             }
                         } else {
@@ -186,12 +190,13 @@ struct SetupView: View {
                                 onComplete()
                             }
                             .keyboardShortcut(.defaultAction)
+                            .buttonStyle(.liquidProminent)
                         }
                     }
                 }
             }
             .padding(20)
-            .background(Color(nsColor: .windowBackgroundColor))
+            .background(.regularMaterial)
         }
         .frame(width: 520, height: 680)
         .onAppear {
