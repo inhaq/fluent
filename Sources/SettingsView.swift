@@ -2046,8 +2046,10 @@ struct RunLogEntryView: View {
 
                     actionIconButton(systemName: "square.and.arrow.up", help: "Export run log") {
                         Task { @MainActor in
-                            let dataURL = resolvedScreenshotDataURL
-                                ?? (hasScreenshotAvailable ? await appState.loadHistoryScreenshot(for: item.id) : nil)
+                            var dataURL = resolvedScreenshotDataURL
+                            if dataURL == nil && hasScreenshotAvailable {
+                                dataURL = await appState.loadHistoryScreenshot(for: item.id)
+                            }
                             TestCaseExporter.exportWithSavePanel(
                                 item: item.withContextScreenshotDataURL(dataURL),
                                 audioDirURL: AppState.audioStorageDirectory()
