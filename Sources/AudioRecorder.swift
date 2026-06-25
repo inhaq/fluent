@@ -587,7 +587,7 @@ final class AudioRecorder: NSObject, ObservableObject, AVCaptureAudioDataOutputS
             // artifacts that degrade word recognition. Quality is configurable
             // (defaults to .max) so it can be profiled — see
             // configuredConverterQuality().
-            new?.sampleRateConverterQuality = Self.configuredConverterQuality()
+            new?.sampleRateConverterQuality = Self.configuredConverterQuality().rawValue
             existing = new
             return new
         }
@@ -1118,7 +1118,7 @@ final class AudioRecorder: NSObject, ObservableObject, AVCaptureAudioDataOutputS
                 return existing
             }
             let new = AVAudioConverter(from: sourceFormat, to: pcm16TargetFormat)
-            new?.sampleRateConverterQuality = Self.configuredConverterQuality()
+            new?.sampleRateConverterQuality = Self.configuredConverterQuality().rawValue
             existing = new
             return new
         }
