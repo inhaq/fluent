@@ -6,6 +6,7 @@ import ServiceManagement
 import ApplicationServices
 import ScreenCaptureKit
 import Carbon
+import os
 import os.log
 private let recordingLog = OSLog(subsystem: "com.zachlatta.freeflow", category: "Recording")
 
@@ -222,6 +223,8 @@ final class AppState: ObservableObject, @unchecked Sendable {
     private let customSystemPromptLastModifiedStorageKey = "custom_system_prompt_last_modified"
     private let customContextPromptLastModifiedStorageKey = "custom_context_prompt_last_modified"
     private let contextScreenshotMaxDimensionStorageKey = "context_screenshot_max_dimension"
+    private let captureScreenshotForDictationStorageKey = "capture_screenshot_for_dictation"
+    private let prewarmMicrophoneEnabledStorageKey = "prewarm_microphone_enabled"
     private let shortcutStartDelayStorageKey = "shortcut_start_delay"
     private let preserveClipboardStorageKey = "preserve_clipboard"
     private let keepDictationInClipboardHistoryStorageKey = "keep_dictation_in_clipboard_history"
@@ -488,6 +491,34 @@ final class AppState: ObservableObject, @unchecked Sendable {
         }
     }
 
+    /// When `false` (the default), plain dictation skips the active-window
+    /// screenshot + vision context call and relies on app/window metadata only.
+    /// This is the "fast mode" path — it removes the most expensive step of
+    /// context collection from the dictation hot path. Command mode always
+    /// captures a screenshot regardless of this setting. Enable this to feed
+    /// on-screen context into dictation post-processing at the cost of latency.
+    @Published var captureScreenshotForDictation: Bool {
+        didSet {
+            UserDefaults.standard.set(captureScreenshotForDictation, forKey: captureScreenshotForDictationStorageKey)
+        }
+    }
+
+    /// Keeps an idle microphone capture session warm between dictations so the
+    /// next recording starts without paying the `AVCaptureSession` startup
+    /// cost. Off by default: a warm session keeps the system microphone-in-use
+    /// indicator lit and draws a little power. The recorder auto-cools-down a
+    /// warm session shortly after use to bound that.
+    @Published var prewarmMicrophoneEnabled: Bool {
+        didSet {
+            UserDefaults.standard.set(prewarmMicrophoneEnabled, forKey: prewarmMicrophoneEnabledStorageKey)
+            if prewarmMicrophoneEnabled {
+                prewarmMicrophoneIfEnabled()
+            } else {
+                audioRecorder.stopPrewarm()
+            }
+        }
+    }
+
     @Published var customSystemPromptLastModified: String {
         didSet {
             UserDefaults.standard.set(customSystemPromptLastModified, forKey: customSystemPromptLastModifiedStorageKey)
@@ -635,6 +666,11 @@ final class AppState: ObservableObject, @unchecked Sendable {
     private var contextCaptureTask: Task<AppContext?, Never>?
     private var capturedContext: AppContext?
     private var hasShownScreenshotPermissionAlert = false
+    // Tracks the in-flight pipeline signpost interval (see PipelineSignpost).
+    // Lives for the duration of one dictation: begun when recording starts,
+    // ended when the transcript is delivered or the session is abandoned.
+    private var dictationSignpostID: OSSignpostID?
+    private var dictationSignpostState: OSSignpostIntervalState?
     private var audioDeviceObservers: [NSObjectProtocol] = []
     private var needsMicrophoneRefreshAfterRecording = false
     private let pipelineHistoryStore = PipelineHistoryStore()
@@ -710,6 +746,8 @@ final class AppState: ObservableObject, @unchecked Sendable {
             ? UserDefaults.standard.integer(forKey: contextScreenshotMaxDimensionStorageKey)
             : Self.defaultContextScreenshotMaxDimension
         let contextScreenshotMaxDimension = Self.normalizedContextScreenshotMaxDimension(storedContextScreenshotMaxDimension)
+        let captureScreenshotForDictation = UserDefaults.standard.bool(forKey: captureScreenshotForDictationStorageKey)
+        let prewarmMicrophoneEnabled = UserDefaults.standard.bool(forKey: prewarmMicrophoneEnabledStorageKey)
         let shortcutStartDelay = max(0, UserDefaults.standard.double(forKey: shortcutStartDelayStorageKey))
         let isCommandModeEnabled = UserDefaults.standard.object(forKey: commandModeEnabledStorageKey) == nil
             ? false
@@ -795,6 +833,8 @@ final class AppState: ObservableObject, @unchecked Sendable {
         self.customContextPrompt = customContextPrompt
         self.instructionExecutionGuardEnabled = instructionExecutionGuardEnabled
         self.contextScreenshotMaxDimension = contextScreenshotMaxDimension
+        self.captureScreenshotForDictation = captureScreenshotForDictation
+        self.prewarmMicrophoneEnabled = prewarmMicrophoneEnabled
         self.customSystemPromptLastModified = customSystemPromptLastModified
         self.customContextPromptLastModified = customContextPromptLastModified
         self.outputLanguage = outputLanguage
@@ -875,6 +915,17 @@ final class AppState: ObservableObject, @unchecked Sendable {
     deinit {
         removeAudioDeviceObservers()
         AppState.writeRecordingStateFlag(false)
+    }
+
+    /// Loads a run's base64 screenshot on demand (when its run-log entry is
+    /// expanded). History is listed without screenshot payloads to keep them
+    /// off the launch/scroll path; this fetches just the one that's needed.
+    func loadHistoryScreenshot(for id: UUID) async -> String? {
+        await withCheckedContinuation { continuation in
+            pipelineHistoryStore.loadScreenshotDataURL(forID: id) { dataURL in
+                continuation.resume(returning: dataURL)
+            }
+        }
     }
 
     private func removeAudioDeviceObservers() {
@@ -1904,6 +1955,7 @@ final class AppState: ObservableObject, @unchecked Sendable {
         tearDownRealtimeService()
         audioRecorder.cancelRecording()
         restoreAudioInterruptionIfNeeded()
+        endDictationSignpost("cancelled")
         endCriticalDictationActivity()
         refreshAvailableMicrophonesIfNeeded()
         if !isRecording && !isTranscribing && statusText == "Cancelled" {
@@ -1933,6 +1985,7 @@ final class AppState: ObservableObject, @unchecked Sendable {
             Self.deleteAudioFile(transcribingAudioFileName)
             self.transcribingAudioFileName = nil
         }
+        endDictationSignpost("cancelled")
         endCriticalDictationActivity()
         refreshAvailableMicrophonesIfNeeded()
         if !isRecording && !isTranscribing && statusText == "Cancelled" {
@@ -2259,13 +2312,27 @@ final class AppState: ObservableObject, @unchecked Sendable {
     }
 
     private func endCriticalDictationActivity() {
+        defer { prewarmMicrophoneIfEnabled() }
         guard automaticTerminationDisabled else { return }
         ProcessInfo.processInfo.enableAutomaticTermination("FreeFlow dictation in progress")
         automaticTerminationDisabled = false
     }
 
+    /// Re-warms the microphone capture session after a dictation ends (and when
+    /// the user enables the option) so the next recording starts fast. Only
+    /// when the option is on and microphone access is already granted, so it
+    /// never triggers a permission prompt. The warm session auto-cools-down in
+    /// AudioRecorder to bound battery/privacy impact.
+    private func prewarmMicrophoneIfEnabled() {
+        guard prewarmMicrophoneEnabled else { return }
+        guard AVCaptureDevice.authorizationStatus(for: .audio) == .authorized else { return }
+        audioRecorder.prewarm(deviceUID: selectedMicrophoneID)
+    }
+
     private func beginRecording(triggerMode: RecordingTriggerMode) {
         os_log(.info, log: recordingLog, "beginRecording() entered")
+        beginDictationSignpost(triggerMode)
+        markDictationSignpost("trigger")
         beginCriticalDictationActivity()
         clearPendingOverlayDismissToken()
         errorMessage = nil
@@ -2299,6 +2366,7 @@ final class AppState: ObservableObject, @unchecked Sendable {
                 guard let self else { return }
                 self.cancelRecordingInitializationTimer()
                 os_log(.info, log: recordingLog, "first real audio — transitioning to waveform")
+                self.markDictationSignpost("recorder ready")
                 self.statusText = "Recording..."
                 self.clearPendingOverlayDismissToken()
                 if overlayShown {
@@ -2354,6 +2422,7 @@ final class AppState: ObservableObject, @unchecked Sendable {
 
     private func handleRecordingFailure(_ error: Error) {
         cancelRecordingInitializationTimer()
+        endDictationSignpost("failure")
         audioRecorder.onRecordingReady = nil
         audioRecorder.onRecordingFailure = nil
         audioLevelCancellable?.cancel()
@@ -2678,6 +2747,7 @@ final class AppState: ObservableObject, @unchecked Sendable {
     private func stopAndTranscribe() {
         cancelPendingShortcutStart()
         cancelRecordingInitializationTimer()
+        markDictationSignpost("stop")
         shortcutSessionController.reset()
         activeRecordingTriggerMode = nil
         let sessionIntent = currentSessionIntent
@@ -2709,6 +2779,7 @@ final class AppState: ObservableObject, @unchecked Sendable {
             guard let self else { return }
             guard let fileURL else {
                 self.isTranscribing = false
+                self.endDictationSignpost("no audio")
                 self.audioRecorder.cleanup()
                 self.endCriticalDictationActivity()
                 self.errorMessage = "No audio recorded"
@@ -2728,6 +2799,7 @@ final class AppState: ObservableObject, @unchecked Sendable {
             let savedAudioFile = Self.saveAudioFile(from: fileURL)
             let transcriptionFileURL = savedAudioFile?.fileURL ?? fileURL
             self.transcribingAudioFileName = savedAudioFile?.fileName
+            self.markDictationSignpost("audio finalized")
             self.statusText = "Transcribing..."
             self.debugStatusMessage = "Transcribing audio"
 
@@ -2792,6 +2864,7 @@ final class AppState: ObservableObject, @unchecked Sendable {
                     }
                     try Task.checkCancellation()
                     await MainActor.run { [weak self] in
+                        self?.markDictationSignpost("transcript received")
                         self?.debugStatusMessage = "Running post-processing"
                     }
                     let result = await self.processTranscript(
@@ -2875,6 +2948,7 @@ final class AppState: ObservableObject, @unchecked Sendable {
                             }
 
                             let pendingClipboardRestore = self.writeTranscriptToPasteboard(trimmedFinalTranscript)
+                            self.markDictationSignpost("paste")
                             self.pasteAtCursorWhenShortcutReleased {
                                 if shouldPressEnterAfterPaste {
                                     self.pressEnterAfterPaste {
@@ -2886,6 +2960,7 @@ final class AppState: ObservableObject, @unchecked Sendable {
                             }
                         }
 
+                        self.endDictationSignpost("delivered")
                         self.audioRecorder.cleanup()
                         self.refreshAvailableMicrophonesIfNeeded()
 
@@ -2894,6 +2969,7 @@ final class AppState: ObservableObject, @unchecked Sendable {
                 } catch is CancellationError {
                     await MainActor.run {
                         self.transcriptionTask = nil
+                        self.endDictationSignpost("cancelled")
                         self.endCriticalDictationActivity()
                     }
                 } catch {
@@ -2912,6 +2988,7 @@ final class AppState: ObservableObject, @unchecked Sendable {
                         let userFacingErrorMessage = self.formattedTranscriptionError(error)
                         self.errorMessage = userFacingErrorMessage
                         self.isTranscribing = false
+                        self.endDictationSignpost("error")
                         self.endCriticalDictationActivity()
                         self.statusText = "Error"
                         self.overlayManager.showError(userFacingErrorMessage)
@@ -3031,17 +3108,52 @@ final class AppState: ObservableObject, @unchecked Sendable {
         realtimeService = nil
     }
 
+    // MARK: - Pipeline signposts
+
+    /// Begins the per-dictation signpost interval and marks the trigger. Safe to
+    /// call repeatedly; any previous interval is closed first so we never leak.
+    private func beginDictationSignpost(_ triggerMode: RecordingTriggerMode) {
+        endDictationSignpost("superseded")
+        let id = PipelineSignpost.signposter.makeSignpostID()
+        dictationSignpostID = id
+        dictationSignpostState = PipelineSignpost.signposter.beginInterval(
+            PipelineSignpost.dictationInterval,
+            id: id,
+            "trigger \(String(describing: triggerMode))"
+        )
+    }
+
+    /// Marks a milestone within the active dictation interval. No-op if no
+    /// dictation is currently being measured.
+    private func markDictationSignpost(_ name: StaticString) {
+        guard let id = dictationSignpostID else { return }
+        PipelineSignpost.signposter.emitEvent(name, id: id)
+    }
+
+    /// Ends the active dictation signpost interval (idempotent).
+    private func endDictationSignpost(_ reason: StaticString = "end") {
+        guard let state = dictationSignpostState else { return }
+        PipelineSignpost.signposter.endInterval(PipelineSignpost.dictationInterval, state, "\(reason)")
+        dictationSignpostState = nil
+        dictationSignpostID = nil
+    }
+
     private func startContextCapture() {
         contextCaptureTask?.cancel()
         capturedContext = nil
         lastContextSummary = "Collecting app context..."
         lastPostProcessingStatus = ""
         lastContextScreenshotDataURL = nil
-        lastContextScreenshotStatus = "Collecting screenshot..."
+        // Command mode needs the screenshot; plain dictation only captures it
+        // when the user has explicitly opted in (fast mode is the default).
+        let shouldCaptureScreenshot = currentSessionIntent.isCommandMode || captureScreenshotForDictation
+        lastContextScreenshotStatus = shouldCaptureScreenshot
+            ? "Collecting screenshot..."
+            : "Screenshot skipped (fast dictation mode)"
 
         contextCaptureTask = Task { [weak self] in
             guard let self else { return nil }
-            let context = await self.contextService.collectContext()
+            let context = await self.contextService.collectContext(captureScreenshot: shouldCaptureScreenshot)
             await MainActor.run {
                 self.capturedContext = context
                 self.lastContextSummary = context.contextSummary

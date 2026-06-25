@@ -67,8 +67,9 @@ final class PipelineHistoryStore {
         container.viewContext.performAndWait {
             let request = pipelineHistoryRequest()
             request.sortDescriptors = [NSSortDescriptor(key: "timestamp", ascending: false)]
+            Self.excludeScreenshotPayload(from: request)
             guard let entities = try? container.viewContext.fetch(request) else { return }
-            result = entities.compactMap(Self.makeHistoryItem(from:))
+            result = entities.compactMap { Self.makeHistoryItem(from: $0, includeScreenshot: false) }
         }
         return result
     }
@@ -76,7 +77,9 @@ final class PipelineHistoryStore {
     /// Loads history off the main thread and delivers the result on the main
     /// queue. Used at launch so the (potentially several-MB) base64 screenshot
     /// payloads aren't materialized synchronously on the main thread during
-    /// app startup.
+    /// app startup. The screenshot column is excluded from the fetch entirely
+    /// (see ``excludeScreenshotPayload``) and loaded lazily per row only when a
+    /// run-log entry is expanded (see ``loadScreenshotDataURL``).
     func loadAllHistoryAsync(completion: @escaping ([PipelineHistoryItem]) -> Void) {
         guard isStoreLoaded else {
             DispatchQueue.main.async { completion([]) }
@@ -86,11 +89,50 @@ final class PipelineHistoryStore {
         context.perform {
             let request = self.pipelineHistoryRequest()
             request.sortDescriptors = [NSSortDescriptor(key: "timestamp", ascending: false)]
+            Self.excludeScreenshotPayload(from: request)
             let entities = (try? context.fetch(request)) ?? []
-            let items = entities.compactMap(Self.makeHistoryItem(from:))
+            let items = entities.compactMap { Self.makeHistoryItem(from: $0, includeScreenshot: false) }
             DispatchQueue.main.async { completion(items) }
         }
     }
+
+    /// Fetches a single run's base64 screenshot `data:` URL on demand. Returns
+    /// `nil` if the store isn't loaded, the entry is gone, or it has no
+    /// screenshot. Always delivers on the main queue.
+    func loadScreenshotDataURL(forID id: UUID, completion: @escaping (String?) -> Void) {
+        guard isStoreLoaded else {
+            DispatchQueue.main.async { completion(nil) }
+            return
+        }
+        let context = container.newBackgroundContext()
+        context.perform {
+            let request = self.pipelineHistoryRequest()
+            request.predicate = NSPredicate(format: "id == %@", id as CVarArg)
+            request.fetchLimit = 1
+            let dataURL = (try? context.fetch(request))?.first?.contextScreenshotDataURL
+            DispatchQueue.main.async { completion(dataURL) }
+        }
+    }
+
+    /// Restricts a fetch to every attribute *except* the heavy base64
+    /// screenshot, so listing history never reads the screenshot blobs from the
+    /// store. Accessing the excluded property later would fault the object in,
+    /// but the bulk loaders deliberately don't (they pass
+    /// `includeScreenshot: false`).
+    private static func excludeScreenshotPayload(from request: NSFetchRequest<PipelineHistoryEntry>) {
+        request.propertiesToFetch = bulkFetchPropertyNames
+        request.returnsObjectsAsFaults = false
+    }
+
+    /// All persisted attributes except `contextScreenshotDataURL`.
+    private static let bulkFetchPropertyNames: [String] = [
+        "intent", "selectedText", "capturedSelection", "id", "timestamp",
+        "rawTranscript", "postProcessedTranscript", "postProcessingPrompt",
+        "systemPrompt", "contextSummary", "contextSystemPrompt", "contextPrompt",
+        "contextScreenshotStatus", "postProcessingStatus", "debugStatus",
+        "customVocabulary", "audioFileName", "contextAppName",
+        "contextBundleIdentifier", "contextWindowTitle"
+    ]
 
     func append(_ item: PipelineHistoryItem, maxCount: Int) throws -> [String] {
         guard isStoreLoaded else { return [] }
@@ -284,7 +326,7 @@ final class PipelineHistoryStore {
         }
     }
 
-    private static func makeHistoryItem(from entity: PipelineHistoryEntry) -> PipelineHistoryItem {
+    private static func makeHistoryItem(from entity: PipelineHistoryEntry, includeScreenshot: Bool = true) -> PipelineHistoryItem {
         PipelineHistoryItem(
             intent: PipelineHistoryItemIntent(rawValue: entity.intent ?? "") ?? .dictation,
             selectedText: entity.selectedText,
@@ -298,7 +340,7 @@ final class PipelineHistoryStore {
             contextSummary: entity.contextSummary ?? "",
             contextSystemPrompt: entity.contextSystemPrompt,
             contextPrompt: entity.contextPrompt,
-            contextScreenshotDataURL: entity.contextScreenshotDataURL,
+            contextScreenshotDataURL: includeScreenshot ? entity.contextScreenshotDataURL : nil,
             contextScreenshotStatus: entity.contextScreenshotStatus ?? "available (image)",
             postProcessingStatus: entity.postProcessingStatus ?? "",
             debugStatus: entity.debugStatus ?? "",

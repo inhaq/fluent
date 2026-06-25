@@ -137,21 +137,21 @@ class TranscriptionService {
         let boundary = UUID().uuidString
         request.setValue("multipart/form-data; boundary=\(boundary)", forHTTPHeaderField: "Content-Type")
 
-        let multipartFileURL = try makeMultipartBodyFile(
-            audioFileURL: fileURL,
-            fileName: fileURL.lastPathComponent,
-            model: transcriptionModel,
-            responseFormat: transcriptionResponseFormat,
-            language: language,
-            prompt: prompt,
-            boundary: boundary
-        )
-        defer {
-            try? FileManager.default.removeItem(at: multipartFileURL)
-        }
-
         do {
-            let (data, response) = try await LLMAPITransport.upload(for: request, fromFile: multipartFileURL)
+            let (data, response): (Data, URLResponse)
+            if Self.streamingUploadEnabled {
+                (data, response) = try await uploadStreamed(
+                    request: request,
+                    audioFileURL: fileURL,
+                    boundary: boundary
+                )
+            } else {
+                (data, response) = try await uploadViaTempFile(
+                    request: request,
+                    audioFileURL: fileURL,
+                    boundary: boundary
+                )
+            }
             return try validateTranscriptionResponse(data: data, response: response, fileURL: fileURL)
         } catch {
             let nsError = error as NSError
@@ -167,6 +167,78 @@ class TranscriptionService {
             )
             throw error
         }
+    }
+
+    /// Opt-in (`stream_multipart_upload` user default) streamed-body upload that
+    /// avoids the multipart temp file entirely. Off by default so the proven
+    /// file-upload path remains the standard.
+    private static var streamingUploadEnabled: Bool {
+        UserDefaults.standard.bool(forKey: "stream_multipart_upload")
+    }
+
+    /// Builds the multipart body on disk and uploads it from the file. This is
+    /// the default, most-reliable path (`URLSession.upload(fromFile:)`).
+    private func uploadViaTempFile(
+        request: URLRequest,
+        audioFileURL: URL,
+        boundary: String
+    ) async throws -> (Data, URLResponse) {
+        let multipartFileURL = try makeMultipartBodyFile(
+            audioFileURL: audioFileURL,
+            fileName: audioFileURL.lastPathComponent,
+            model: transcriptionModel,
+            responseFormat: transcriptionResponseFormat,
+            language: language,
+            prompt: prompt,
+            boundary: boundary
+        )
+        defer {
+            try? FileManager.default.removeItem(at: multipartFileURL)
+        }
+        return try await LLMAPITransport.upload(for: request, fromFile: multipartFileURL)
+    }
+
+    /// Streams the multipart body to the server with neither a full in-memory
+    /// copy nor a temp file (see ``StreamingMultipartBody``).
+    private func uploadStreamed(
+        request: URLRequest,
+        audioFileURL: URL,
+        boundary: String
+    ) async throws -> (Data, URLResponse) {
+        let prefix = multipartPrefixData(
+            fileName: audioFileURL.lastPathComponent,
+            model: transcriptionModel,
+            responseFormat: transcriptionResponseFormat,
+            language: language,
+            prompt: prompt,
+            boundary: boundary
+        )
+        let suffix = multipartSuffixData(boundary: boundary)
+
+        guard let body = StreamingMultipartBody(
+            prefix: prefix,
+            fileURL: audioFileURL,
+            suffix: suffix
+        ) else {
+            // Fall back to the reliable temp-file path if the audio file can't
+            // be sized/streamed for some reason.
+            return try await uploadViaTempFile(
+                request: request,
+                audioFileURL: audioFileURL,
+                boundary: boundary
+            )
+        }
+
+        var streamingRequest = request
+        streamingRequest.httpBodyStream = body.inputStream
+        streamingRequest.setValue(String(body.contentLength), forHTTPHeaderField: "Content-Length")
+        body.start()
+        // Always tear the producer down, even if the upload throws or the task
+        // is cancelled. `cancel()` is thread-safe and idempotent, so the normal
+        // end-of-stream shutdown still wins on the success path.
+        defer { body.cancel() }
+
+        return try await LLMAPITransport.uploadStreaming(for: streamingRequest)
     }
 
     /// Validates the HTTP response from a transcription upload, mapping
@@ -240,44 +312,68 @@ class TranscriptionService {
             try? output.close()
         }
 
-        func append(_ value: String) throws {
-            if let data = value.data(using: .utf8) {
-                try output.write(contentsOf: data)
-            }
-        }
+        try output.write(contentsOf: multipartPrefixData(
+            fileName: fileName,
+            model: model,
+            responseFormat: responseFormat,
+            language: language,
+            prompt: prompt,
+            boundary: boundary
+        ))
+        try appendFile(audioFileURL, to: output)
+        try output.write(contentsOf: multipartSuffixData(boundary: boundary))
 
-        try append("--\(boundary)\r\n")
-        try append("Content-Disposition: form-data; name=\"model\"\r\n\r\n")
-        try append("\(model)\r\n")
+        return outputURL
+    }
 
-        try append("--\(boundary)\r\n")
-        try append("Content-Disposition: form-data; name=\"response_format\"\r\n\r\n")
-        try append("\(responseFormat)\r\n")
+    /// The multipart body up to (and including) the file part's header, i.e.
+    /// everything that precedes the raw audio bytes. Shared by the temp-file
+    /// and streamed upload paths so both produce a byte-identical body.
+    private func multipartPrefixData(
+        fileName: String,
+        model: String,
+        responseFormat: String,
+        language: String?,
+        prompt: String?,
+        boundary: String
+    ) -> Data {
+        var body = ""
 
-        try append("--\(boundary)\r\n")
-        try append("Content-Disposition: form-data; name=\"temperature\"\r\n\r\n")
-        try append("0\r\n")
+        body += "--\(boundary)\r\n"
+        body += "Content-Disposition: form-data; name=\"model\"\r\n\r\n"
+        body += "\(model)\r\n"
+
+        body += "--\(boundary)\r\n"
+        body += "Content-Disposition: form-data; name=\"response_format\"\r\n\r\n"
+        body += "\(responseFormat)\r\n"
+
+        body += "--\(boundary)\r\n"
+        body += "Content-Disposition: form-data; name=\"temperature\"\r\n\r\n"
+        body += "0\r\n"
 
         if let language, !language.isEmpty {
-            try append("--\(boundary)\r\n")
-            try append("Content-Disposition: form-data; name=\"language\"\r\n\r\n")
-            try append("\(language)\r\n")
+            body += "--\(boundary)\r\n"
+            body += "Content-Disposition: form-data; name=\"language\"\r\n\r\n"
+            body += "\(language)\r\n"
         }
 
         if let prompt, !prompt.isEmpty {
-            try append("--\(boundary)\r\n")
-            try append("Content-Disposition: form-data; name=\"prompt\"\r\n\r\n")
-            try append("\(prompt)\r\n")
+            body += "--\(boundary)\r\n"
+            body += "Content-Disposition: form-data; name=\"prompt\"\r\n\r\n"
+            body += "\(prompt)\r\n"
         }
 
-        try append("--\(boundary)\r\n")
-        try append("Content-Disposition: form-data; name=\"file\"; filename=\"\(fileName)\"\r\n")
-        try append("Content-Type: \(audioContentType(for: fileName))\r\n\r\n")
-        try appendFile(audioFileURL, to: output)
-        try append("\r\n")
-        try append("--\(boundary)--\r\n")
+        body += "--\(boundary)\r\n"
+        body += "Content-Disposition: form-data; name=\"file\"; filename=\"\(fileName)\"\r\n"
+        body += "Content-Type: \(audioContentType(for: fileName))\r\n\r\n"
 
-        return outputURL
+        return Data(body.utf8)
+    }
+
+    /// The multipart body that follows the raw audio bytes (the closing
+    /// boundary).
+    private func multipartSuffixData(boundary: String) -> Data {
+        Data("\r\n--\(boundary)--\r\n".utf8)
     }
 
     private func appendFile(_ sourceURL: URL, to output: FileHandle) throws {

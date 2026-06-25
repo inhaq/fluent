@@ -94,7 +94,7 @@ Return only two sentences, no labels, no markdown, no extra commentary.
         )
     }
 
-    func collectContext() async -> AppContext {
+    func collectContext(captureScreenshot: Bool = true) async -> AppContext {
         let contextSystemPrompt = resolveContextPrompt()
 
         guard let frontmostApp = NSWorkspace.shared.frontmostApplication else {
@@ -118,11 +118,21 @@ Return only two sentences, no labels, no markdown, no extra commentary.
 
         let windowTitle = focusedWindowTitle(from: appElement) ?? appName
         let selectedText = selectedText(from: appElement)
-        let screenshot = captureActiveWindowScreenshot(
-            processIdentifier: frontmostApp.processIdentifier,
-            appElement: appElement,
-            focusedWindowTitle: windowTitle
-        )
+        // Fast dictation path: capturing + JPEG-compressing the active window
+        // and then sending it to the vision context model is the single most
+        // expensive step of context collection. For plain dictation it's
+        // usually unnecessary (app/window metadata is enough), so callers can
+        // skip it. Command mode (and an explicit opt-in) still capture it.
+        let screenshot: (dataURL: String?, mimeType: String?, error: String?)
+        if captureScreenshot {
+            screenshot = captureActiveWindowScreenshot(
+                processIdentifier: frontmostApp.processIdentifier,
+                appElement: appElement,
+                focusedWindowTitle: windowTitle
+            )
+        } else {
+            screenshot = (nil, nil, "Screenshot skipped (fast dictation mode)")
+        }
         let currentActivity: String
         let contextPrompt: String?
         if !apiKey.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
