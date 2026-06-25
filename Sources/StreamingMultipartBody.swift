@@ -45,9 +45,20 @@ final class StreamingMultipartBody: NSObject, StreamDelegate {
     private var fileHandle: FileHandle?
     private var thread: Thread?
 
+    /// Guards `isFinished` so shutdown can be requested safely from any thread.
+    private let lock = NSLock()
+    private var isFinished = false
+
     init?(prefix: Data, fileURL: URL, suffix: Data, chunkSize: Int = 64 * 1024) {
         let attributes = try? FileManager.default.attributesOfItem(atPath: fileURL.path)
-        guard let fileSize = (attributes?[.size] as? NSNumber)?.intValue else { return nil }
+        // Use `integerValue` (Int-sized) rather than `intValue` so large audio
+        // files aren't truncated when computing `Content-Length`.
+        guard let fileSize = (attributes?[.size] as? NSNumber)?.integerValue else { return nil }
+
+        // Open the file up front so a read failure surfaces here and the caller
+        // can fall back to the temp-file path, instead of silently sending a
+        // truncated body that still advertises the full `Content-Length`.
+        guard let handle = try? FileHandle(forReadingFrom: fileURL) else { return nil }
 
         var input: InputStream?
         var output: OutputStream?
@@ -56,7 +67,10 @@ final class StreamingMultipartBody: NSObject, StreamDelegate {
             inputStream: &input,
             outputStream: &output
         )
-        guard let input, let output else { return nil }
+        guard let input, let output else {
+            try? handle.close()
+            return nil
+        }
 
         self.inputStream = input
         self.outputStream = output
@@ -64,6 +78,7 @@ final class StreamingMultipartBody: NSObject, StreamDelegate {
         self.suffix = suffix
         self.fileURL = fileURL
         self.chunkSize = chunkSize
+        self.fileHandle = handle
         self.contentLength = prefix.count + fileSize + suffix.count
         super.init()
     }
@@ -105,30 +120,40 @@ final class StreamingMultipartBody: NSObject, StreamDelegate {
     }
 
     /// Writes as much of the body as the output stream will currently accept.
+    /// Keeps draining within a single `.hasSpaceAvailable` event: a partial
+    /// write (or a short prefix chunk) does not necessarily trigger another
+    /// space-available callback, so we loop until `write()` reports the buffer
+    /// is full (returns `0`), the body is fully drained, or an error occurs.
     private func pump() {
-        if pendingOffset >= pending.count {
-            pending = nextChunk()
-            pendingOffset = 0
-            if pending.isEmpty {
-                // Entire body has been written.
+        while true {
+            if pendingOffset >= pending.count {
+                pending = nextChunk()
+                pendingOffset = 0
+                if pending.isEmpty {
+                    // Entire body has been written.
+                    finish()
+                    return
+                }
+            }
+
+            let remaining = pending.count - pendingOffset
+            let written = pending.withUnsafeBytes { raw -> Int in
+                guard let base = raw.bindMemory(to: UInt8.self).baseAddress else { return -1 }
+                return outputStream.write(base + pendingOffset, maxLength: remaining)
+            }
+
+            if written > 0 {
+                pendingOffset += written
+                // Loop again to keep filling the stream's buffer.
+            } else if written < 0 {
                 finish()
+                return
+            } else {
+                // written == 0 means no space right now; wait for the next
+                // .hasSpaceAvailable event.
                 return
             }
         }
-
-        let remaining = pending.count - pendingOffset
-        let written = pending.withUnsafeBytes { raw -> Int in
-            guard let base = raw.bindMemory(to: UInt8.self).baseAddress else { return -1 }
-            return outputStream.write(base + pendingOffset, maxLength: remaining)
-        }
-
-        if written > 0 {
-            pendingOffset += written
-        } else if written < 0 {
-            finish()
-        }
-        // written == 0 means no space right now; wait for the next
-        // .hasSpaceAvailable event.
     }
 
     /// Returns the next slice of the body, advancing through prefix -> file
@@ -139,13 +164,20 @@ final class StreamingMultipartBody: NSObject, StreamDelegate {
             stage = .file
             return prefix
         case .file:
-            if fileHandle == nil {
-                fileHandle = try? FileHandle(forReadingFrom: fileURL)
-            }
-            if let handle = fileHandle,
-               let chunk = try? handle.read(upToCount: chunkSize),
-               !chunk.isEmpty {
-                return chunk
+            // The file handle is opened in `init`; if a read fails partway
+            // through we tear the stream down rather than skipping to the
+            // closing boundary and sending a truncated body.
+            if let handle = fileHandle {
+                if let chunk = try? handle.read(upToCount: chunkSize) {
+                    if !chunk.isEmpty {
+                        return chunk
+                    }
+                } else {
+                    os_log(.error, log: uploadLog,
+                           "streaming body file read failed; aborting upload")
+                    finish()
+                    return Data()
+                }
             }
             try? fileHandle?.close()
             fileHandle = nil
@@ -159,10 +191,33 @@ final class StreamingMultipartBody: NSObject, StreamDelegate {
         }
     }
 
-    private func finish() {
-        guard outputStream.streamStatus != .closed else { return }
-        outputStream.close()
-        outputStream.remove(from: .current, forMode: .default)
+    /// Thread-safe shutdown hook. Safe to call from any thread and any number
+    /// of times. Use this from the upload caller (e.g. in a `defer`) so the
+    /// producer thread and bound streams are always torn down, even when the
+    /// upload throws or the task is cancelled before the stream callbacks run.
+    func cancel() {
+        if let thread, thread.isExecuting, Thread.current != thread {
+            // Hop onto the producer thread so all stream operations stay on the
+            // run loop that scheduled the stream.
+            perform(#selector(finish), on: thread, with: nil, waitUntilDone: false)
+        } else {
+            finish()
+        }
+    }
+
+    @objc private func finish() {
+        lock.lock()
+        if isFinished {
+            lock.unlock()
+            return
+        }
+        isFinished = true
+        lock.unlock()
+
+        if outputStream.streamStatus != .closed {
+            outputStream.close()
+            outputStream.remove(from: .current, forMode: .default)
+        }
         try? fileHandle?.close()
         fileHandle = nil
         thread?.cancel()

@@ -233,12 +233,12 @@ class TranscriptionService {
         streamingRequest.httpBodyStream = body.inputStream
         streamingRequest.setValue(String(body.contentLength), forHTTPHeaderField: "Content-Length")
         body.start()
+        // Always tear the producer down, even if the upload throws or the task
+        // is cancelled. `cancel()` is thread-safe and idempotent, so the normal
+        // end-of-stream shutdown still wins on the success path.
+        defer { body.cancel() }
 
-        let result = try await LLMAPITransport.uploadStreaming(for: streamingRequest)
-        // Keep `body` alive until the upload returns; releasing it earlier could
-        // tear the producer down mid-stream.
-        withExtendedLifetime(body) {}
-        return result
+        return try await LLMAPITransport.uploadStreaming(for: streamingRequest)
     }
 
     /// Validates the HTTP response from a transcription upload, mapping

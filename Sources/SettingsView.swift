@@ -1931,6 +1931,10 @@ struct RunLogEntryView: View {
     /// listed without their (potentially multi-MB) base64 screenshots; we fetch
     /// the one belonging to this entry only when the user opens it.
     @State private var lazyScreenshotDataURL: String?
+    /// Tracks whether an on-demand screenshot load has already been attempted,
+    /// so a load that resolves to `nil` shows an "unavailable" state instead of
+    /// spinning forever.
+    @State private var attemptedLazyScreenshotLoad = false
 
     private var resolvedScreenshotDataURL: String? {
         item.contextScreenshotDataURL ?? lazyScreenshotDataURL
@@ -2132,17 +2136,27 @@ struct RunLogEntryView: View {
                                                 .frame(maxWidth: .infinity)
                                                 .overlay(ProgressView().controlSize(.small))
                                         }
-                                    } else if hasScreenshotAvailable {
+                                    } else if hasScreenshotAvailable && !attemptedLazyScreenshotLoad {
                                         RoundedRectangle(cornerRadius: 4)
                                             .fill(Color(nsColor: .controlBackgroundColor))
                                             .frame(height: 120)
                                             .frame(maxWidth: .infinity)
                                             .overlay(ProgressView().controlSize(.small))
                                             .task {
-                                                if lazyScreenshotDataURL == nil {
+                                                if lazyScreenshotDataURL == nil && !attemptedLazyScreenshotLoad {
+                                                    attemptedLazyScreenshotLoad = true
                                                     lazyScreenshotDataURL = await appState.loadHistoryScreenshot(for: item.id)
                                                 }
                                             }
+                                    } else if hasScreenshotAvailable {
+                                        HStack(spacing: 6) {
+                                            Image(systemName: "photo.badge.exclamationmark")
+                                                .font(.caption)
+                                                .foregroundStyle(.secondary)
+                                            Text("Screenshot unavailable")
+                                                .font(.caption)
+                                                .foregroundStyle(.secondary)
+                                        }
                                     }
 
                                     if let prompt = item.contextPrompt, !prompt.isEmpty {
