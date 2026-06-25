@@ -51,9 +51,10 @@ final class StreamingMultipartBody: NSObject, StreamDelegate {
 
     init?(prefix: Data, fileURL: URL, suffix: Data, chunkSize: Int = 64 * 1024) {
         let attributes = try? FileManager.default.attributesOfItem(atPath: fileURL.path)
-        // Use `integerValue` (Int-sized) rather than `intValue` so large audio
-        // files aren't truncated when computing `Content-Length`.
-        guard let fileSize = (attributes?[.size] as? NSNumber)?.integerValue else { return nil }
+        // In Swift, `NSNumber.intValue` maps to Objective-C `integerValue`
+        // (`NSInteger`), which is `Int` (64-bit on macOS), so it doesn't
+        // truncate large file sizes when computing `Content-Length`.
+        guard let fileSize = (attributes?[.size] as? NSNumber)?.intValue else { return nil }
 
         // Open the file up front so a read failure surfaces here and the caller
         // can fall back to the temp-file path, instead of silently sending a
