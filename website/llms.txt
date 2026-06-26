@@ -17,7 +17,13 @@ Fluent uses Groq by default for transcription and LLM-powered cleanup. It suppor
 
 ## How Fluent Differs From Free Flow
 
-Fluent keeps Free Flow's features but is optimized for efficiency and speed. Plain dictation skips screenshot capture by default, so most dictations send only lightweight app and window metadata to the context model instead of a full image. When a screenshot is used (for example in Edit Mode), it is downscaled and JPEG-compressed before being sent, which lowers image token usage. The default cleanup model runs with low reasoning effort and reasoning output disabled. The combined effect is fewer tokens billed per dictation and lower end-to-end latency.
+Fluent keeps Free Flow's features but was reworked along three lines after the fork: speed, transcription accuracy, and token efficiency.
+
+Speed: an optional warm-microphone session keeps an idle capture session alive so recording starts without AVCaptureSession cold-start latency, and a fast dictation mode skips the screenshot and vision/context model call for plain dictation so finishing a dictation does not wait on a context request. The audio capture path, launch, and UI were also optimized, and os_signpost instrumentation measures end-to-end latency.
+
+Accuracy: speech-to-text was reworked using techniques from the Whisper paper ("Robust Speech Recognition via Large-Scale Weak Supervision"), including robust per-segment decoding (no_speech_prob, avg_logprob, compression_ratio), an audio front-end (high-pass filter, loudness normalization, high-quality resampling), deterministic temperature=0 decoding, and custom-vocabulary biasing of the raw transcript.
+
+Token efficiency: a user-configurable Post-Processing Reasoning setting (Automatic/Off/Low/Medium/High) controls reasoning_effort (not configurable in Free Flow), the default cleanup prompt was roughly halved in length, screenshots default to 768px when used, and reasoning blocks are always stripped from output.
 
 ## Privacy
 

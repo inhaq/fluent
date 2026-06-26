@@ -10,18 +10,31 @@ This project uses semantic versioning for public releases. Use `MAJOR.MINOR.PATC
 
 ## [1.2.0] - 2026-06-26
 
-The project is now **Fluent**, a faster, more token-efficient fork of Free Flow. This release rebrands the app and trims the dictation pipeline so each dictation uses fewer tokens and completes more quickly, without changing the core experience.
+The project is now **Fluent**, a fork of Free Flow reworked for speed, transcription accuracy, and token efficiency. This release rebrands the app and folds in the improvements made since the fork.
 
 ### Changed
 
 - Renamed the app and project from FreeFlow to Fluent, including the bundle identifier (`com.inhaq.fluent`), app menus, permission prompts, build tooling, and the project website.
 
+### Added
+
+- Post-Processing Reasoning setting (Automatic / Off / Low / Medium / High) that controls the cleanup model's `reasoning_effort`, letting you trade accuracy for fewer tokens and faster cleanup. This was not configurable in Free Flow.
+- Optional warm-microphone session that keeps an idle capture session alive between dictations so recording starts without `AVCaptureSession` cold-start latency, with an automatic idle cool-down.
+- Fast dictation mode that skips the screenshot and vision/context LLM call for plain dictation, with a "Capture screenshot for dictation" opt-in for when you want richer context.
+- Custom vocabulary is now sent to the transcriber as a biasing prompt, so names, jargon, and acronyms are spelled correctly in the raw transcript.
+- `os_signpost` instrumentation across the dictation pipeline (trigger, recorder ready, stop, audio finalized, transcript received, paste) for measuring end-to-end latency.
+- Optional streamed multipart upload path for transcription requests.
+
 ### Improved
 
-- Plain dictation now skips screenshot capture entirely and sends only lightweight app and window metadata to the context model, removing the most expensive step from the common dictation path and saving the image tokens it used to spend.
-- Screenshots, when still needed (such as in Edit Mode), are captured at a smaller default dimension (768px), JPEG-compressed, and cropped of surrounding whitespace before upload, lowering image token usage.
-- The default cleanup model runs with low reasoning effort and reasoning output disabled, reducing token overhead and latency.
-- Reasoning blocks are always stripped from model output so reasoning-oriented models stay fast and never paste their internal scratch work.
+- Reworked speech-to-text using techniques from the Whisper paper ("Robust Speech Recognition via Large-Scale Weak Supervision"): robust per-segment decoding based on `no_speech_prob`, `avg_logprob`, and `compression_ratio` that rejects hallucinations while preserving quiet, low-confidence real speech.
+- Added an audio front-end (80 Hz high-pass, loudness normalization with a safe peak ceiling and gain cap, and maximum-quality 16 kHz resampling) to improve recognition of soft or distant speech, with a full fallback to the original recording on any error.
+- Transcription now decodes at `temperature=0` for stable, repeatable output.
+- Rewrote the default cleanup system prompt from roughly 720 to about 370 words while preserving every behavioral rule, roughly halving the fixed prompt tokens per cleanup call.
+- Lowered the default context screenshot dimension from 1024px to 768px (about 44% fewer pixels) and crop surrounding whitespace before upload.
+- `<think>`/`<thinking>` reasoning blocks are now always stripped from model output across the whole model family, so reasoning models never paste their scratch work.
+- Optimized the audio capture hot path (decode each buffer once, Accelerate/vDSP metering, throttled level updates), launch (async microphone discovery), run-history loading (lazy screenshots), and Settings rendering for a smoother, more responsive app.
+- Added `qwen/qwen3.6-27b` to the model list and removed the GitHub star promo card and its launch-time network request.
 
 
 
