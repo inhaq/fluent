@@ -47,21 +47,21 @@ if ! grep -q 'tags:' .github/workflows/release.yml || ! grep -q 'v\*\.\*\.\*' .g
   exit 1
 fi
 
-if ! .github/scripts/changelog-section.sh "$version" >/tmp/freeflow-release-notes.md; then
+if ! .github/scripts/changelog-section.sh "$version" >/tmp/fluent-release-notes.md; then
   echo "Could not extract CHANGELOG.md section for $version" >&2
   exit 1
 fi
 
-if [[ ! -s /tmp/freeflow-release-notes.md ]]; then
+if [[ ! -s /tmp/fluent-release-notes.md ]]; then
   echo "Extracted changelog section is empty for $version" >&2
   exit 1
 fi
 
-if ! grep -q "^## \\[$version\\]" /tmp/freeflow-release-notes.md; then
+if ! grep -q "^## \\[$version\\]" /tmp/fluent-release-notes.md; then
   echo "Extracted changelog section has an unexpected heading." >&2
   exit 1
 fi
 
 echo "Release checks passed for $tag"
 echo
-cat /tmp/freeflow-release-notes.md
+cat /tmp/fluent-release-notes.md

@@ -8,7 +8,7 @@ import ScreenCaptureKit
 import Carbon
 import os
 import os.log
-private let recordingLog = OSLog(subsystem: "com.zachlatta.freeflow", category: "Recording")
+private let recordingLog = OSLog(subsystem: "com.inhaq.fluent", category: "Recording")
 
 struct VoiceMacro: Codable, Identifiable, Equatable {
     var id: UUID = UUID()
@@ -59,7 +59,7 @@ enum SettingsTab: String, CaseIterable, Identifiable {
 
 enum AppBuild {
     static var isDevBundle: Bool {
-        (Bundle.main.object(forInfoDictionaryKey: "CFBundleName") as? String) == "FreeFlow Dev"
+        (Bundle.main.object(forInfoDictionaryKey: "CFBundleName") as? String) == "Fluent Dev"
     }
 }
 
@@ -1175,7 +1175,7 @@ final class AppState: ObservableObject, @unchecked Sendable {
         return audioDir
     }
 
-    /// URL of the flag file written while FreeFlow is actively recording.
+    /// URL of the flag file written while Fluent is actively recording.
     ///
     /// External tools (voice assistants, TTS barge-in pipelines, conversation
     /// apps) can poll this file to know when the user is dictating. The file
@@ -1183,18 +1183,18 @@ final class AppState: ObservableObject, @unchecked Sendable {
     /// Contents are the UNIX timestamp (seconds, float) of when recording
     /// started — useful for stale-flag detection after an unclean exit.
     ///
-    /// Path: `~/Library/Application Support/FreeFlow/is-recording`
-    /// (or `FreeFlow Dev/is-recording` when running the dev bundle).
+    /// Path: `~/Library/Application Support/Fluent/is-recording`
+    /// (or `Fluent Dev/is-recording` when running the dev bundle).
     static func recordingStateFlagURL() -> URL {
         let appSupport = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first!
-        let appName = Bundle.main.object(forInfoDictionaryKey: "CFBundleName") as? String ?? "FreeFlow"
+        let appName = Bundle.main.object(forInfoDictionaryKey: "CFBundleName") as? String ?? "Fluent"
         return appSupport.appendingPathComponent("\(appName)/is-recording")
     }
 
     /// Serial queue that owns every flag-file I/O so the recording
     /// start/stop hot path never blocks on disk.
     private static let recordingStateFlagQueue = DispatchQueue(
-        label: "com.zachlatta.freeflow.recording-state-flag"
+        label: "com.inhaq.fluent.recording-state-flag"
     )
 
     /// Write or clear the `is-recording` flag file. Called from the
@@ -2333,14 +2333,14 @@ final class AppState: ObservableObject, @unchecked Sendable {
 
     private func beginCriticalDictationActivity() {
         guard !automaticTerminationDisabled else { return }
-        ProcessInfo.processInfo.disableAutomaticTermination("FreeFlow dictation in progress")
+        ProcessInfo.processInfo.disableAutomaticTermination("Fluent dictation in progress")
         automaticTerminationDisabled = true
     }
 
     private func endCriticalDictationActivity() {
         defer { prewarmMicrophoneIfEnabled() }
         guard automaticTerminationDisabled else { return }
-        ProcessInfo.processInfo.enableAutomaticTermination("FreeFlow dictation in progress")
+        ProcessInfo.processInfo.enableAutomaticTermination("Fluent dictation in progress")
         automaticTerminationDisabled = false
     }
 

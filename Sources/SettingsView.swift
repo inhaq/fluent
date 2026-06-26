@@ -501,7 +501,7 @@ struct GeneralSettingsView: View {
     }
 
     private var appBuildNumber: String {
-        Bundle.main.object(forInfoDictionaryKey: "FreeFlowBuildTag") as? String
+        Bundle.main.object(forInfoDictionaryKey: "FluentBuildTag") as? String
             ?? Bundle.main.object(forInfoDictionaryKey: "CFBundleVersion") as? String
             ?? "unknown"
     }
@@ -911,7 +911,7 @@ struct GeneralSettingsView: View {
             }
             .pickerStyle(.menu)
 
-            Text("When set, FreeFlow translates your speech into the selected language.")
+            Text("When set, Fluent translates your speech into the selected language.")
                 .font(.caption)
                 .foregroundStyle(.secondary)
         }
@@ -1560,7 +1560,7 @@ struct PromptsSettingsView: View {
             )
             .toggleStyle(.switch)
 
-            Text("When enabled, FreeFlow retries or falls back to the literal transcript if post-processing looks like it answered the dictated text instead of cleaning it.")
+            Text("When enabled, Fluent retries or falls back to the literal transcript if post-processing looks like it answered the dictated text instead of cleaning it.")
                 .font(.caption)
                 .foregroundStyle(.secondary)
         }
@@ -1585,7 +1585,7 @@ struct PromptsSettingsView: View {
 
         let context = AppContext(
             appName: "\(AppName.displayName) Settings",
-            bundleIdentifier: "com.zachlatta.freeflow",
+            bundleIdentifier: "com.inhaq.fluent",
             windowTitle: "System Prompt Test",
             selectedText: nil,
             currentActivity: "User is testing the system prompt in \(AppName.displayName) settings.",

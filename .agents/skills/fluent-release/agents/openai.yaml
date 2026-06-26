@@ -1,0 +1,4 @@
+interface:
+  display_name: "Fluent Release"
+  short_description: "Prepare and publish Fluent semver releases."
+  default_prompt: "Prepare a new Fluent release."

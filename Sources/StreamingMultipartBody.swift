@@ -1,7 +1,7 @@
 import Foundation
 import os.log
 
-private let uploadLog = OSLog(subsystem: "com.zachlatta.freeflow", category: "Upload")
+private let uploadLog = OSLog(subsystem: "com.inhaq.fluent", category: "Upload")
 
 /// Streams a `multipart/form-data` request body to `URLSession` without ever
 /// holding the whole body in memory *or* writing a temporary copy to disk.
@@ -99,7 +99,7 @@ final class StreamingMultipartBody: NSObject, StreamDelegate {
                 RunLoop.current.run(mode: .default, before: .distantFuture)
             }
         }
-        thread.name = "com.zachlatta.freeflow.upload.body"
+        thread.name = "com.inhaq.fluent.upload.body"
         self.thread = thread
         thread.start()
     }

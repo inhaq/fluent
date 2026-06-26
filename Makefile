@@ -1,8 +1,8 @@
-APP_NAME ?= FreeFlow Dev
-BUNDLE_ID ?= com.zachlatta.freeflow.dev
+APP_NAME ?= Fluent Dev
+BUNDLE_ID ?= com.inhaq.fluent.dev
 BUILD_DIR = build
 APP_BUNDLE = $(BUILD_DIR)/$(APP_NAME).app
-CODESIGN_IDENTITY ?= FreeFlow Dev
+CODESIGN_IDENTITY ?= Fluent Dev
 CONTENTS = $(APP_BUNDLE)/Contents
 MACOS_DIR = $(CONTENTS)/MacOS
 empty :=
@@ -16,8 +16,8 @@ ARCH ?= $(shell uname -m)
 
 # Pick the icon source based on which bundle we are building. Dev builds get
 # a distinct hammer-on-waveform icon so a developer's dock shows at a glance
-# which FreeFlow they are running when both are installed side by side.
-ifeq ($(APP_NAME),FreeFlow Dev)
+# which Fluent they are running when both are installed side by side.
+ifeq ($(APP_NAME),Fluent Dev)
 ICON_SOURCE = Resources/AppIcon-Dev-Source.png
 ICON_ICNS = Resources/AppIcon-Dev.icns
 else
@@ -65,7 +65,7 @@ endif
 	@plutil -replace NSMicrophoneUsageDescription -string "$(APP_NAME) needs microphone access to transcribe your speech." "$(CONTENTS)/Info.plist"
 	@plutil -replace NSSpeechRecognitionUsageDescription -string "$(APP_NAME) needs speech recognition to convert your voice to text." "$(CONTENTS)/Info.plist"
 	@plutil -replace NSAccessibilityUsageDescription -string "$(APP_NAME) needs accessibility access to detect the text cursor position and paste transcribed text." "$(CONTENTS)/Info.plist"
-	@codesign --force --options runtime --sign "$(CODESIGN_IDENTITY)" --entitlements FreeFlow.entitlements "$(APP_BUNDLE)"
+	@codesign --force --options runtime --sign "$(CODESIGN_IDENTITY)" --entitlements Fluent.entitlements "$(APP_BUNDLE)"
 	@echo "Built $(APP_BUNDLE)"
 
 icon: $(ICON_ICNS)

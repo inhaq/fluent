@@ -9,7 +9,7 @@ final class NetworkMonitor {
     static let shared = NetworkMonitor()
 
     private let monitor = NWPathMonitor()
-    private let queue = DispatchQueue(label: "com.zachlatta.freeflow.network-monitor")
+    private let queue = DispatchQueue(label: "com.inhaq.fluent.network-monitor")
     private let lock = NSLock()
     private var started = false
 

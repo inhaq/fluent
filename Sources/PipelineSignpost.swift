@@ -11,13 +11,13 @@ import os
 ///     -> transcript received -> paste
 ///
 /// Open Instruments with the "os_signpost" / "Points of Interest" instrument
-/// (subsystem `com.zachlatta.freeflow`) to see the end-to-end latency and the
+/// (subsystem `com.inhaq.fluent`) to see the end-to-end latency and the
 /// gaps between stages, rather than inferring them from log lines.
 enum PipelineSignpost {
     /// Category `PointsOfInterest` makes the intervals/events land on the
     /// dedicated Points of Interest track in Instruments.
     static let signposter = OSSignposter(
-        subsystem: "com.zachlatta.freeflow",
+        subsystem: "com.inhaq.fluent",
         category: "PointsOfInterest"
     )
 

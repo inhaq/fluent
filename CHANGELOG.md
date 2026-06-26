@@ -1,6 +1,6 @@
 # Changelog
 
-All notable changes to FreeFlow are documented here.
+All notable changes to Fluent are documented here.
 
 This project uses semantic versioning for public releases. Use `MAJOR.MINOR.PATCH`, where:
 
@@ -8,7 +8,22 @@ This project uses semantic versioning for public releases. Use `MAJOR.MINOR.PATC
 - `MINOR` changes add user-visible features and improvements.
 - `PATCH` changes fix bugs, polish existing behavior, or make small internal improvements.
 
-## [1.1.0] - 2026-06-03
+## [1.2.0] - 2026-06-26
+
+The project is now **Fluent**, a faster, more token-efficient fork of Free Flow. This release rebrands the app and trims the dictation pipeline so each dictation uses fewer tokens and completes more quickly, without changing the core experience.
+
+### Changed
+
+- Renamed the app and project from FreeFlow to Fluent, including the bundle identifier (`com.inhaq.fluent`), app menus, permission prompts, build tooling, and the project website.
+
+### Improved
+
+- Plain dictation now skips screenshot capture entirely and sends only lightweight app and window metadata to the context model, removing the most expensive step from the common dictation path and saving the image tokens it used to spend.
+- Screenshots, when still needed (such as in Edit Mode), are captured at a smaller default dimension (768px), JPEG-compressed, and cropped of surrounding whitespace before upload, lowering image token usage.
+- The default cleanup model runs with low reasoning effort and reasoning output disabled, reducing token overhead and latency.
+- Reasoning blocks are always stripped from model output so reasoning-oriented models stay fast and never paste their internal scratch work.
+
+
 
 ### Added
 
@@ -31,7 +46,7 @@ This project uses semantic versioning for public releases. Use `MAJOR.MINOR.PATC
 
 ## [1.0.0] - 2026-05-20
 
-FreeFlow is now considered feature-complete and stable enough for a 1.0 release.
+Fluent is now considered feature-complete and stable enough for a 1.0 release.
 
 ### Added
 
@@ -65,9 +80,9 @@ FreeFlow is now considered feature-complete and stable enough for a 1.0 release.
 ### Added
 
 - Output Language setting for automatically translating dictated text before it is pasted.
-- Transcription Language setting for choosing the language FreeFlow listens for during dictation.
-- Recording state flag file for external tools that need to know when FreeFlow is actively recording.
-- Distinct FreeFlow Dev app and menu bar icons so development builds are easier to tell apart from release builds.
+- Transcription Language setting for choosing the language Fluent listens for during dictation.
+- Recording state flag file for external tools that need to know when Fluent is actively recording.
+- Distinct Fluent Dev app and menu bar icons so development builds are easier to tell apart from release builds.
 
 ### Improved
 
@@ -78,7 +93,7 @@ FreeFlow is now considered feature-complete and stable enough for a 1.0 release.
 ### Fixed
 
 - Fixed audio recording crashes caused by unexpected input formats, resampling, and upload-path conversion.
-- Fixed cases where FreeFlow could silently fall back when the selected microphone was unavailable.
+- Fixed cases where Fluent could silently fall back when the selected microphone was unavailable.
 - Fixed paste shortcuts on Colemak-DH and other non-QWERTY keyboard layouts.
 - Fixed output language handling when custom system prompts are enabled.
 
@@ -99,7 +114,7 @@ FreeFlow is now considered feature-complete and stable enough for a 1.0 release.
 - A voice command for submitting text: say "press enter" at the end of a dictation.
 - Audio controls that can mute or pause other audio while you dictate, then restore it when recording stops.
 - Build details in Settings for easier troubleshooting.
-- Direct shortcuts from FreeFlow to the right macOS permission settings.
+- Direct shortcuts from Fluent to the right macOS permission settings.
 - A What’s New popup when an update is available.
 
 ### Improved
@@ -109,9 +124,9 @@ FreeFlow is now considered feature-complete and stable enough for a 1.0 release.
 - Exported run logs include more useful context for reproducing issues.
 - Realtime transcription is more reliable when recordings are cancelled, retried, or finish with no text.
 - Provider settings are easier to edit without accidental whitespace or half-saved values.
-- FreeFlow now warns you if alert sounds may be hard to hear because system audio is muted or very low.
+- Fluent now warns you if alert sounds may be hard to hear because system audio is muted or very low.
 - Update prompts now show the version, release date, and release notes more clearly.
-- FreeFlow now uses proper version numbers for updates instead of internal build names.
+- Fluent now uses proper version numbers for updates instead of internal build names.
 
 ### Fixed
 

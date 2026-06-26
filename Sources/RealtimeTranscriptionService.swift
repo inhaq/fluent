@@ -1,7 +1,7 @@
 import Foundation
 import os.log
 
-private let realtimeLog = OSLog(subsystem: "com.zachlatta.freeflow", category: "RealtimeTranscription")
+private let realtimeLog = OSLog(subsystem: "com.inhaq.fluent", category: "RealtimeTranscription")
 
 enum RealtimeTranscriptionError: LocalizedError {
     case invalidBaseURL(String)
@@ -32,7 +32,7 @@ final class RealtimeTranscriptionService {
     private var task: URLSessionWebSocketTask?
     private var receiveTask: Task<Void, Never>?
 
-    private let stateQueue = DispatchQueue(label: "com.zachlatta.freeflow.realtime.state")
+    private let stateQueue = DispatchQueue(label: "com.inhaq.fluent.realtime.state")
     private var finalText: String = ""
     private var partialText: String = ""
     // Coalesce appended PCM into ~100ms chunks before encoding/sending. Capture
