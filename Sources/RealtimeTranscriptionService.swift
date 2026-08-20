@@ -32,7 +32,12 @@ final class RealtimeTranscriptionService {
     private var task: URLSessionWebSocketTask?
     private var receiveTask: Task<Void, Never>?
 
-    private let stateQueue = DispatchQueue(label: "com.inhaq.fluent.realtime.state")
+    // Serializes socket state while audio streams through it during a live
+    // dictation; .userInitiated keeps it off efficiency cores.
+    private let stateQueue = DispatchQueue(
+        label: "com.inhaq.fluent.realtime.state",
+        qos: .userInitiated
+    )
     private var finalText: String = ""
     private var partialText: String = ""
     // Coalesce appended PCM into ~100ms chunks before encoding/sending. Capture

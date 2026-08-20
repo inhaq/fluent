@@ -1093,11 +1093,24 @@ struct SetupView: View {
 
     func startAccessibilityPolling() {
         accessibilityTimer?.invalidate()
-        accessibilityTimer = Timer.scheduledTimer(withTimeInterval: 1.0, repeats: true) { _ in
+        checkAccessibility()
+        guard !accessibilityGranted else { return }
+        let timer = Timer.scheduledTimer(withTimeInterval: 1.0, repeats: true) { timer in
             DispatchQueue.main.async {
                 checkAccessibility()
+                // AXIsProcessTrusted() is a synchronous call into TCC. Stop
+                // asking the moment the answer turns yes — the grant is
+                // irreversible for the lifetime of this wizard.
+                if accessibilityGranted {
+                    timer.invalidate()
+                    accessibilityTimer = nil
+                }
             }
         }
+        // Nothing here is time-critical; tolerance lets the kernel coalesce the
+        // wakeup with other timers instead of firing on an exact 1s boundary.
+        timer.tolerance = 0.25
+        accessibilityTimer = timer
     }
 
     func requestAccessibility() {
@@ -1106,11 +1119,22 @@ struct SetupView: View {
 
     func startScreenRecordingPolling() {
         screenRecordingTimer?.invalidate()
-        screenRecordingTimer = Timer.scheduledTimer(withTimeInterval: 1.0, repeats: true) { _ in
+        appState.hasScreenRecordingPermission = CGPreflightScreenCaptureAccess()
+        guard !appState.hasScreenRecordingPermission else { return }
+        let timer = Timer.scheduledTimer(withTimeInterval: 1.0, repeats: true) { timer in
             DispatchQueue.main.async {
-                appState.hasScreenRecordingPermission = CGPreflightScreenCaptureAccess()
+                let granted = CGPreflightScreenCaptureAccess()
+                appState.hasScreenRecordingPermission = granted
+                // CGPreflightScreenCaptureAccess() is a synchronous round trip
+                // to the window server. Stop polling once granted.
+                if granted {
+                    timer.invalidate()
+                    screenRecordingTimer = nil
+                }
             }
         }
+        timer.tolerance = 0.25
+        screenRecordingTimer = timer
     }
 
     // MARK: - Test Transcription

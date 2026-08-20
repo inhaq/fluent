@@ -85,7 +85,7 @@ Return only two sentences, no labels, no markdown, no extra commentary.
             )
         }
 
-        let appElement = AXUIElementCreateApplication(frontmostApp.processIdentifier)
+        let appElement = AccessibilityIPC.applicationElement(for: frontmostApp.processIdentifier)
         return AppSelectionSnapshot(
             appName: frontmostApp.localizedName,
             bundleIdentifier: frontmostApp.bundleIdentifier,
@@ -114,7 +114,7 @@ Return only two sentences, no labels, no markdown, no extra commentary.
 
         let appName = frontmostApp.localizedName
         let bundleIdentifier = frontmostApp.bundleIdentifier
-        let appElement = AXUIElementCreateApplication(frontmostApp.processIdentifier)
+        let appElement = AccessibilityIPC.applicationElement(for: frontmostApp.processIdentifier)
 
         let windowTitle = focusedWindowTitle(from: appElement) ?? appName
         let selectedText = selectedText(from: appElement)
@@ -374,7 +374,13 @@ Selected text: \(selectedText ?? "None")
               CFGetTypeID(rawValue) == AXUIElementGetTypeID() else {
             return nil
         }
-        return unsafeBitCast(rawValue, to: AXUIElement.self)
+        let child = unsafeBitCast(rawValue, to: AXUIElement.self)
+        // A copied-out element is a distinct AXUIElement and does not inherit
+        // the parent's messaging timeout, so bound it here too. Without this,
+        // querying a focused window or focused UI element falls back to the
+        // 6-second system default. See AccessibilityIPC.
+        AXUIElementSetMessagingTimeout(child, AccessibilityIPC.messagingTimeout)
+        return child
     }
 
     private func accessibilityString(from element: AXUIElement, attribute: CFString) -> String? {
@@ -656,10 +662,14 @@ Selected text: \(selectedText ?? "None")
                     properties: [.compressionFactor: comp]
                 ) else { continue }
 
-                let base64 = imageData.base64EncodedString()
-                if base64.count <= maxScreenshotDataURILength {
-                    return "data:\(mimeType);base64,\(base64)"
+                // Base64 length is exactly 4*ceil(n/3), so the budget can be
+                // checked arithmetically. Encoding first meant allocating up to
+                // nine ~500 KB Strings per screenshot just to discover the first
+                // eight overshot.
+                guard 4 * ((imageData.count + 2) / 3) <= maxScreenshotDataURILength else {
+                    continue
                 }
+                return "data:\(mimeType);base64,\(imageData.base64EncodedString())"
             }
         }
 

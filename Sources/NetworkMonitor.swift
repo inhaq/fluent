@@ -9,7 +9,11 @@ final class NetworkMonitor {
     static let shared = NetworkMonitor()
 
     private let monitor = NWPathMonitor()
-    private let queue = DispatchQueue(label: "com.inhaq.fluent.network-monitor")
+    // Reachability updates are background work — nothing waits on them.
+    private let queue = DispatchQueue(
+        label: "com.inhaq.fluent.network-monitor",
+        qos: .utility
+    )
     private let lock = NSLock()
     private var started = false
 

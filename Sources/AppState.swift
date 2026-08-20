@@ -618,7 +618,9 @@ final class AppState: ObservableObject, @unchecked Sendable {
             AppState.writeRecordingStateFlag(isRecording)
         }
     }
-    @Published var isTranscribing = false
+    @Published var isTranscribing = false {
+        didSet { refreshEscapeInterceptState() }
+    }
     @Published var retryingItemIDs: Set<UUID> = []
     @Published var lastTranscript: String = ""
     @Published var errorMessage: String?
@@ -667,6 +669,10 @@ final class AppState: ObservableObject, @unchecked Sendable {
     private var contextCaptureTask: Task<AppContext?, Never>?
     private var capturedContext: AppContext?
     private var hasShownScreenshotPermissionAlert = false
+    private var hasReportedHistoryStorageUnavailable = false
+    private var historyReloadRetryCount = 0
+    private static let maxHistoryReloadRetries = 3
+
     // Tracks the in-flight pipeline signpost interval (see PipelineSignpost).
     // Lives for the duration of one dictation: begun when recording starts,
     // ended when the transcript is delivered or the session is abandoned.
@@ -680,12 +686,26 @@ final class AppState: ObservableObject, @unchecked Sendable {
     /// in-memory state.
     private var pipelineHistoryMutationGeneration = 0
     private let shortcutSessionController = DictationShortcutSessionController()
-    private var activeRecordingTriggerMode: RecordingTriggerMode?
+    private var activeRecordingTriggerMode: RecordingTriggerMode? {
+        didSet { refreshEscapeInterceptState() }
+    }
     private var currentSessionIntent: SessionIntent = .dictation
     private var pendingSelectionSnapshot: AppSelectionSnapshot?
     private var pendingManualCommandInvocation = false
     private var pendingShortcutStartTask: Task<Void, Never>?
-    private var pendingShortcutStartMode: RecordingTriggerMode?
+    private var pendingShortcutStartMode: RecordingTriggerMode? {
+        didSet { refreshEscapeInterceptState() }
+    }
+    /// Mirrors "an Escape keypress would cancel something right now" for the
+    /// global shortcut event tap.
+    ///
+    /// The tap callback runs on its own run-loop thread and must never block on
+    /// the main thread: a `.defaultTap` CGEvent tap sits in the synchronous
+    /// delivery path for every keystroke on the system, so stalling it delays
+    /// Escape in *every* app — and past the tap timeout macOS disables the tap
+    /// outright. Kept in sync from the main thread by the `didSet` observers on
+    /// the three inputs ``handleEscapeKeyPress`` reads.
+    private let escapeInterceptsKeyPress = OSAllocatedUnfairLock(initialState: false)
     private var realtimeService: RealtimeTranscriptionService?
     private var automaticTerminationDisabled = false
     private var activeAudioInterruption: ActiveAudioInterruption?
@@ -787,15 +807,6 @@ final class AppState: ObservableObject, @unchecked Sendable {
 
         let initialAccessibility = AXIsProcessTrusted()
         let initialScreenCapturePermission = CGPreflightScreenCaptureAccess()
-        var removedAudioFileNames: [String] = []
-        do {
-            removedAudioFileNames = try pipelineHistoryStore.trim(to: maxPipelineHistoryCount)
-        } catch {
-            print("Failed to trim pipeline history during init: \(error)")
-        }
-        for audioFileName in removedAudioFileNames {
-            Self.deleteAudioFile(audioFileName)
-        }
         // History (which can include several MB of base64 screenshot payloads)
         // is loaded asynchronously after init to keep it off the launch
         // critical path. See loadPipelineHistoryAsync() below.
@@ -892,7 +903,141 @@ final class AppState: ObservableObject, @unchecked Sendable {
         // Clear any stale recording flag left over from an unclean exit.
         AppState.writeRecordingStateFlag(false)
 
+        // Order matters: both run on the store's serial queue, so trimming first
+        // means the load that follows never publishes rows the trim is about to
+        // delete. (Previously trim ran synchronously in init, ahead of the load,
+        // which gave the same ordering at the cost of blocking launch.)
+        trimPipelineHistoryAsync()
         loadPipelineHistoryAsync()
+        sweepOrphanedAudioFilesAsync()
+    }
+
+    /// Deletes WAV files in the audio directory that no history row references.
+    ///
+    /// Removing a history entry deletes the row and the file as two separate
+    /// operations, so an unclean exit between them orphans the file — it is
+    /// never listed, never played, and never cleaned up. Runs once at launch,
+    /// after the trim, on the store's serial queue: at that point no
+    /// transcription is in flight, so every unreferenced file is genuinely dead.
+    private func sweepOrphanedAudioFilesAsync() {
+        // The whole sweep — reference fetch, directory scan, and deletion — runs
+        // inside one store-queue operation. Fetching references and then
+        // scanning on another queue left a window in which a just-finished
+        // dictation could copy its WAV into place and have it deleted before its
+        // append committed.
+        pipelineHistoryStore.withReferencedAudioFileNames { result in
+            guard case .success(let referenced) = result else {
+                // Store unavailable or the fetch failed. Sweeping now could
+                // delete files whose rows simply were not readable, so skip.
+                return
+            }
+            let directory = Self.audioStorageDirectory()
+            guard let names = try? FileManager.default.contentsOfDirectory(atPath: directory.path) else {
+                return
+            }
+            // Read the reservations *after* listing the directory. Reservations
+            // are taken before a file is created, so anything that appears in
+            // `names` had its reservation taken earlier and still holds it —
+            // reading the set afterwards therefore cannot miss it. Reading
+            // before the listing would invert that and could miss a file copied
+            // in between.
+            let pending = Self.pendingAudioFileNames.withLock { $0 }
+            var removed = 0
+            for name in names {
+                guard name.hasSuffix(".wav") else { continue }
+                guard !referenced.contains(name), !pending.contains(name) else { continue }
+                try? FileManager.default.removeItem(at: directory.appendingPathComponent(name))
+                removed += 1
+            }
+            if removed > 0 {
+                os_log(
+                    .info,
+                    log: recordingLog,
+                    "Swept %d orphaned audio file(s) with no history row",
+                    removed
+                )
+            }
+        }
+    }
+
+    /// Handles a failed history mutation.
+    ///
+    /// The in-memory list is updated optimistically so the UI stays responsive,
+    /// which means a failure leaves it describing a state that never reached
+    /// disk. Reconcile by re-reading the store — except when the store is
+    /// unavailable entirely, in which case the in-memory list is the only copy
+    /// the user has and clearing it would be strictly worse than keeping it.
+    private func reconcileHistoryAfterFailure(_ error: Error, whileTrying action: String) {
+        guard !(error is PipelineHistoryStoreUnavailableError) else {
+            // Persistence is off for this launch. The in-memory list is the only
+            // copy the user has, so keep it — and say so once rather than
+            // banner-ing after every dictation.
+            reportHistoryStorageUnavailableOnce(error)
+            return
+        }
+        errorMessage = "\(action): \(error.localizedDescription)"
+        loadPipelineHistoryAsync()
+    }
+
+    /// Retries a failed history reload with bounded exponential backoff.
+    ///
+    /// Only for transient errors — an unavailable store is handled separately,
+    /// since no amount of retrying will open it.
+    private func retryHistoryReload(after error: Error) {
+        guard historyReloadRetryCount < Self.maxHistoryReloadRetries else {
+            os_log(
+                .error,
+                log: recordingLog,
+                "History reload failed %d times, giving up: %{public}@",
+                Self.maxHistoryReloadRetries,
+                error.localizedDescription
+            )
+            errorMessage = "Run history couldn't be refreshed: \(error.localizedDescription)"
+            historyReloadRetryCount = 0
+            return
+        }
+        historyReloadRetryCount += 1
+        let delay = 0.5 * pow(2.0, Double(historyReloadRetryCount))
+        os_log(
+            .info,
+            log: recordingLog,
+            "History reload failed (attempt %d), retrying in %.1fs: %{public}@",
+            historyReloadRetryCount,
+            delay,
+            error.localizedDescription
+        )
+        DispatchQueue.main.asyncAfter(deadline: .now() + delay) { [weak self] in
+            self?.loadPipelineHistoryAsync()
+        }
+    }
+
+    /// Reports unavailable history storage a single time per launch.
+    private func reportHistoryStorageUnavailableOnce(_ error: Error) {
+        guard !hasReportedHistoryStorageUnavailable else { return }
+        hasReportedHistoryStorageUnavailable = true
+        os_log(
+            .error,
+            log: recordingLog,
+            "History persistence unavailable: %{public}@",
+            error.localizedDescription
+        )
+        errorMessage = "Run history can't be saved this session. Dictation still works."
+    }
+
+    /// Trims persisted history down to the cap and removes the audio files that
+    /// fall off the end. Runs entirely on the store's background queue so the
+    /// launch path never touches SQLite.
+    private func trimPipelineHistoryAsync() {
+        pipelineHistoryStore.trim(to: maxPipelineHistoryCount) { result in
+            switch result {
+            case .success(let removedAudioFileNames):
+                for audioFileName in removedAudioFileNames {
+                    Self.deleteAudioFile(audioFileName)
+                }
+            case .failure(let error):
+                print("Failed to trim pipeline history: \(error)")
+            }
+        }
     }
 
     /// Loads persisted pipeline history off the main thread and publishes it
@@ -900,8 +1045,27 @@ final class AppState: ObservableObject, @unchecked Sendable {
     /// payloads from blocking app launch.
     private func loadPipelineHistoryAsync() {
         let generation = pipelineHistoryMutationGeneration
-        pipelineHistoryStore.loadAllHistoryAsync { [weak self] items in
+        pipelineHistoryStore.loadAllHistoryAsync { [weak self] result in
             guard let self else { return }
+            // Never replace the visible history on a failed read: this is
+            // reached from reconcileHistoryAfterFailure, so a store in a bad
+            // state would otherwise cascade one failed write into wiping the
+            // user's entire run log.
+            guard case .success(let items) = result else {
+                guard case .failure(let error) = result else { return }
+                if error is PipelineHistoryStoreUnavailableError {
+                    // Persistence is off for the whole launch. Report once and
+                    // stop — retrying cannot succeed.
+                    self.reportHistoryStorageUnavailableOnce(error)
+                } else {
+                    // A transient fetch error. The store is fine, so retry
+                    // rather than leaving the UI stale for the rest of the
+                    // session on the strength of one bad read.
+                    self.retryHistoryReload(after: error)
+                }
+                return
+            }
+            self.historyReloadRetryCount = 0
             if self.pipelineHistoryMutationGeneration == generation {
                 self.pipelineHistory = items
             } else {
@@ -916,6 +1080,15 @@ final class AppState: ObservableObject, @unchecked Sendable {
     deinit {
         removeAudioDeviceObservers()
         AppState.writeRecordingStateFlag(false)
+    }
+
+    /// Releases everything the app is holding purely as a cache: decoded
+    /// screenshot bitmaps and the Core Data row cache. Called on system memory
+    /// pressure — this process is resident all day, so it should be the one that
+    /// gives memory back rather than the one that gets compressed.
+    func releaseCachedMemory() {
+        DataURLImageCache.shared.removeAll()
+        pipelineHistoryStore.releaseCachedObjects()
     }
 
     /// Loads a run's base64 screenshot on demand (when its run-log entry is
@@ -1216,13 +1389,40 @@ final class AppState: ObservableObject, @unchecked Sendable {
         }
     }
 
+    /// Audio filenames reserved on disk whose history row has not committed yet.
+    ///
+    /// The reservation is taken **before** the file is created, not after: the
+    /// orphan sweep scans the directory, so a name registered only once the copy
+    /// returned left the finished file visible-but-unreferenced for the duration
+    /// of the copy. Type-scoped because ``saveAudioFile`` is static and must be
+    /// able to reserve before it writes anything.
+    ///
+    /// Written from the audio-save task, read from the store's serial queue.
+    private static let pendingAudioFileNames = OSAllocatedUnfairLock(initialState: Set<String>())
+
+    /// Reserves `fileName` so the orphan sweep spares it.
+    private static func reserveAudioFileName(_ fileName: String) {
+        pendingAudioFileNames.withLock { _ = $0.insert(fileName) }
+    }
+
+    /// Releases a reservation. Called once the history row has settled either
+    /// way, or immediately if the file was never created.
+    static func releaseAudioFileName(_ fileName: String?) {
+        guard let fileName else { return }
+        pendingAudioFileNames.withLock { _ = $0.remove(fileName) }
+    }
+
     static func saveAudioFile(from tempURL: URL) -> SavedAudioFile? {
         let fileName = UUID().uuidString + ".wav"
         let destURL = audioStorageDirectory().appendingPathComponent(fileName)
+        // Reserve before the file exists, so the sweep can never observe it
+        // unreferenced.
+        reserveAudioFileName(fileName)
         do {
             try FileManager.default.copyItem(at: tempURL, to: destURL)
             return SavedAudioFile(fileName: fileName, fileURL: destURL)
         } catch {
+            releaseAudioFileName(fileName)
             os_log(
                 .error,
                 log: recordingLog,
@@ -1236,9 +1436,18 @@ final class AppState: ObservableObject, @unchecked Sendable {
         }
     }
 
-    static func saveAudioFileAsync(from tempURL: URL) -> Task<SavedAudioFile?, Never> {
-        Task.detached(priority: .utility) {
-            saveAudioFile(from: tempURL)
+    /// Copies the recording into audio storage off the caller's thread, holding
+    /// a recorder lease for the duration.
+    ///
+    /// The lease is taken *synchronously*, before the detached task starts:
+    /// this runs after `isTranscribing` has already been cleared, so the user
+    /// can be recording again while the copy is in flight, and without the lease
+    /// a `cleanup()` could delete the source mid-copy.
+    static func saveAudioFileAsync(from tempURL: URL, retainedBy recorder: AudioRecorder) -> Task<SavedAudioFile?, Never> {
+        recorder.retainRecordingFile()
+        return Task.detached(priority: .utility) {
+            defer { recorder.releaseRecordingFile() }
+            return saveAudioFile(from: tempURL)
         }
     }
 
@@ -1248,28 +1457,36 @@ final class AppState: ObservableObject, @unchecked Sendable {
     }
 
     func clearPipelineHistory() {
-        do {
-            let removedAudioFileNames = try pipelineHistoryStore.clearAll()
-            for audioFileName in removedAudioFileNames {
-                Self.deleteAudioFile(audioFileName)
+        // Clear the in-memory list immediately so the UI responds at once; the
+        // store catches up on its own queue and reports the audio files it
+        // dropped so they can be removed from disk.
+        pipelineHistoryMutationGeneration += 1
+        pipelineHistory = []
+        pipelineHistoryStore.clearAll { [weak self] result in
+            switch result {
+            case .success(let removedAudioFileNames):
+                for audioFileName in removedAudioFileNames {
+                    Self.deleteAudioFile(audioFileName)
+                }
+            case .failure(let error):
+                self?.reconcileHistoryAfterFailure(error, whileTrying: "Unable to clear run history")
             }
-            pipelineHistoryMutationGeneration += 1
-            pipelineHistory = []
-        } catch {
-            errorMessage = "Unable to clear run history: \(error.localizedDescription)"
         }
     }
 
     func deleteHistoryEntry(id: UUID) {
         guard let index = pipelineHistory.firstIndex(where: { $0.id == id }) else { return }
-        do {
-            if let audioFileName = try pipelineHistoryStore.delete(id: id) {
-                Self.deleteAudioFile(audioFileName)
+        pipelineHistoryMutationGeneration += 1
+        pipelineHistory.remove(at: index)
+        pipelineHistoryStore.delete(id: id) { [weak self] result in
+            switch result {
+            case .success(let audioFileName):
+                if let audioFileName {
+                    Self.deleteAudioFile(audioFileName)
+                }
+            case .failure(let error):
+                self?.reconcileHistoryAfterFailure(error, whileTrying: "Unable to delete run history entry")
             }
-            pipelineHistoryMutationGeneration += 1
-            pipelineHistory.remove(at: index)
-        } catch {
-            errorMessage = "Unable to delete run history entry: \(error.localizedDescription)"
         }
     }
 
@@ -1367,20 +1584,20 @@ final class AppState: ObservableObject, @unchecked Sendable {
                         contextBundleIdentifier: item.contextBundleIdentifier,
                         contextWindowTitle: item.contextWindowTitle
                     )
-                    do {
-                        try pipelineHistoryStore.update(updatedItem)
-                        pipelineHistoryMutationGeneration += 1
-                        if let idx = pipelineHistory.firstIndex(where: { $0.id == updatedItem.id }) {
-                            pipelineHistory[idx] = updatedItem
+                    pipelineHistoryStore.update(updatedItem) { [weak self] result in
+                        if case .failure(let error) = result {
+                            self?.reconcileHistoryAfterFailure(error, whileTrying: "Failed to save retry result")
                         }
-                        let trimmedRetryTranscript = finalTranscript.trimmingCharacters(in: .whitespacesAndNewlines)
-                        if !trimmedRetryTranscript.isEmpty {
-                            lastTranscript = trimmedRetryTranscript
-                            NSPasteboard.general.clearContents()
-                            NSPasteboard.general.setString(trimmedRetryTranscript, forType: .string)
-                        }
-                    } catch {
-                        errorMessage = "Failed to save retry result: \(error.localizedDescription)"
+                    }
+                    pipelineHistoryMutationGeneration += 1
+                    if let idx = pipelineHistory.firstIndex(where: { $0.id == updatedItem.id }) {
+                        pipelineHistory[idx] = updatedItem
+                    }
+                    let trimmedRetryTranscript = finalTranscript.trimmingCharacters(in: .whitespacesAndNewlines)
+                    if !trimmedRetryTranscript.isEmpty {
+                        lastTranscript = trimmedRetryTranscript
+                        NSPasteboard.general.clearContents()
+                        NSPasteboard.general.setString(trimmedRetryTranscript, forType: .string)
                     }
                     retryingItemIDs.remove(item.id)
                 }
@@ -1409,13 +1626,15 @@ final class AppState: ObservableObject, @unchecked Sendable {
                         contextBundleIdentifier: item.contextBundleIdentifier,
                         contextWindowTitle: item.contextWindowTitle
                     )
-                    do {
-                        try pipelineHistoryStore.update(updatedItem)
-                        pipelineHistoryMutationGeneration += 1
-                        if let idx = pipelineHistory.firstIndex(where: { $0.id == updatedItem.id }) {
-                            pipelineHistory[idx] = updatedItem
+                    pipelineHistoryStore.update(updatedItem) { [weak self] result in
+                        if case .failure(let error) = result {
+                            self?.reconcileHistoryAfterFailure(error, whileTrying: "Failed to save retry result")
                         }
-                    } catch {}
+                    }
+                    pipelineHistoryMutationGeneration += 1
+                    if let idx = pipelineHistory.firstIndex(where: { $0.id == updatedItem.id }) {
+                        pipelineHistory[idx] = updatedItem
+                    }
                     retryingItemIDs.remove(item.id)
                 }
             }
@@ -1430,7 +1649,7 @@ final class AppState: ObservableObject, @unchecked Sendable {
         if hasAccessibility && hasScreenRecordingPermission {
             return
         }
-        accessibilityTimer = Timer.scheduledTimer(withTimeInterval: 2.0, repeats: true) { [weak self] _ in
+        let timer = Timer.scheduledTimer(withTimeInterval: 2.0, repeats: true) { [weak self] _ in
             DispatchQueue.main.async {
                 guard let self else { return }
                 self.hasAccessibility = AXIsProcessTrusted()
@@ -1441,6 +1660,11 @@ final class AppState: ObservableObject, @unchecked Sendable {
                 }
             }
         }
+        // Permission grants are not time-sensitive to half a second. Tolerance
+        // lets the system coalesce this wakeup, which matters for a process
+        // that is resident in the menu bar all day.
+        timer.tolerance = 0.5
+        accessibilityTimer = timer
     }
 
     func stopAccessibilityPolling() {
@@ -1805,13 +2029,14 @@ final class AppState: ObservableObject, @unchecked Sendable {
             }
         }
         hotkeyManager.onEscapeKeyPressed = { [weak self] in
-            if Thread.isMainThread {
-                return self?.handleEscapeKeyPress() ?? false
-            }
-
-            return DispatchQueue.main.sync {
-                self?.handleEscapeKeyPress() ?? false
-            }
+            guard let self else { return false }
+            // Called on the event tap thread. Answer consume/passthrough from a
+            // lock-protected snapshot and hand the cancellation to main
+            // asynchronously — see `escapeInterceptsKeyPress` for why this must
+            // never be a synchronous hop.
+            guard self.escapeInterceptsKeyPress.withLock({ $0 }) else { return false }
+            DispatchQueue.main.async { _ = self.handleEscapeKeyPress() }
+            return true
         }
         restartHotkeyMonitoring()
     }
@@ -1895,6 +2120,17 @@ final class AppState: ObservableObject, @unchecked Sendable {
                 pendingShortcutStartMode = .toggle
             }
         }
+    }
+
+    /// Recomputes the escape-intercept mirror the event tap reads. Must be
+    /// called on the main thread; the `didSet` observers on `isTranscribing`,
+    /// `pendingShortcutStartMode`, and `activeRecordingTriggerMode` cover every
+    /// mutation site so the mirror cannot drift from the real state.
+    private func refreshEscapeInterceptState() {
+        let intercepts = isTranscribing
+            || pendingShortcutStartMode == .toggle
+            || activeRecordingTriggerMode == .toggle
+        escapeInterceptsKeyPress.withLock { $0 = intercepts }
     }
 
     private func handleEscapeKeyPress() -> Bool {
@@ -2715,10 +2951,41 @@ final class AppState: ObservableObject, @unchecked Sendable {
     /// was never started) fall back to the file-based POST so the user still
     /// gets a transcript. Runs the realtime commit and file upload in that
     /// strict order to avoid paying for both when realtime succeeds.
+    /// Queue for audio enhancement. Kept off the Swift cooperative pool because
+    /// `enhancedWAV` performs blocking file I/O and a long CPU pass with no
+    /// suspension point.
+    private static let audioEnhancementQueue = DispatchQueue(
+        label: "com.inhaq.fluent.audio.enhance",
+        qos: .userInitiated
+    )
+
+    /// Runs `AudioRecorder.enhancedWAV` off the cooperative pool while staying
+    /// structured, so the calling task awaits it rather than orphaning it.
+    ///
+    /// The work is wrapped in ``AudioRecorder/withRecordingFileRetained(_:)``
+    /// because the cancel path calls `audioRecorder.cleanup()`, which deletes
+    /// the very file being read. Cancellation checks around this call are not
+    /// sufficient on their own — they cannot cover the interval *during* the
+    /// read — so the recorder defers the deletion until the read releases it.
+    private static func enhancedWAVOffCooperativePool(
+        at fileURL: URL,
+        recorder: AudioRecorder
+    ) async -> URL? {
+        await withCheckedContinuation { continuation in
+            audioEnhancementQueue.async {
+                let result = recorder.withRecordingFileRetained {
+                    AudioRecorder.enhancedWAV(at: fileURL)
+                }
+                continuation.resume(returning: result)
+            }
+        }
+    }
+
     private static func resolveRawTranscript(
         realtimeService: RealtimeTranscriptionService?,
         fileService: TranscriptionService,
-        fileURL: URL
+        fileURL: URL,
+        recorder: AudioRecorder
     ) async throws -> String {
         // Enhance the recording before upload (high-pass to lift SNR of quiet
         // speech, then loudness-normalize) so faint dictation reaches Whisper
@@ -2726,7 +2993,40 @@ final class AppState: ObservableObject, @unchecked Sendable {
         // sessions don't pay the enhancement cost when they never upload.
         // Falls back to the original file if enhancement is skipped or fails.
         func transcribeEnhancedFile() async throws -> String {
-            let uploadFileURL = AudioRecorder.enhancedWAV(at: fileURL) ?? fileURL
+            // Hold the recording for the whole enhance-*and-upload* span, not
+            // just the enhancement pass. When enhancement is skipped or fails,
+            // the upload streams the original recording off disk, and
+            // cancelTranscription() calls audioRecorder.cleanup() — which would
+            // delete the file out from under URLSession mid-request.
+            recorder.retainRecordingFile()
+            defer { recorder.releaseRecordingFile() }
+
+            // Bail before touching the source file: if cleanup() already ran,
+            // the file is gone and the retain above cannot bring it back.
+            try Task.checkCancellation()
+
+            // enhancedWAV reads the whole recording off disk and runs a filter
+            // pass over it — blocking I/O plus CPU with no suspension point — so
+            // it must not run on a cooperative pool thread. It goes to a
+            // dedicated queue rather than Task.detached: a detached task does
+            // not inherit cancellation, so it would keep reading a file the
+            // cancel path has already removed, outliving the session that
+            // started it. Suspending on a continuation keeps the work
+            // structured — this task does not complete until enhancement does.
+            let enhancedURL = await Self.enhancedWAVOffCooperativePool(at: fileURL, recorder: recorder)
+
+            // Enhancement can take ~100 ms on a long recording; the session may
+            // have been cancelled meanwhile, taking the source file with it.
+            do {
+                try Task.checkCancellation()
+            } catch {
+                if let enhancedURL {
+                    try? FileManager.default.removeItem(at: enhancedURL)
+                }
+                throw error
+            }
+
+            let uploadFileURL = enhancedURL ?? fileURL
             defer {
                 if uploadFileURL != fileURL {
                     try? FileManager.default.removeItem(at: uploadFileURL)
@@ -2800,7 +3100,7 @@ final class AppState: ObservableObject, @unchecked Sendable {
 
             guard self.isTranscribing else {
                 self.tearDownRealtimeService()
-                self.audioRecorder.cleanup()
+                self.audioRecorder.discardRecording(at: fileURL)
                 self.refreshAvailableMicrophonesIfNeeded()
                 return
             }
@@ -2825,7 +3125,7 @@ final class AppState: ObservableObject, @unchecked Sendable {
             self.transcriptionTask?.cancel()
             guard self.isTranscribing else {
                 activeRealtime?.cancel()
-                self.audioRecorder.cleanup()
+                self.audioRecorder.discardRecording(at: transcriptionFileURL)
                 self.endCriticalDictationActivity()
                 self.refreshAvailableMicrophonesIfNeeded()
                 return
@@ -2839,7 +3139,8 @@ final class AppState: ObservableObject, @unchecked Sendable {
                     async let transcript = Self.resolveRawTranscript(
                         realtimeService: activeRealtime,
                         fileService: transcriptionService,
-                        fileURL: transcriptionFileURL
+                        fileURL: transcriptionFileURL,
+                        recorder: self.audioRecorder
                     )
                     let rawTranscript = try await transcript
                     let parsedTranscript = Self.parseTranscriptCommands(
@@ -2960,9 +3261,14 @@ final class AppState: ObservableObject, @unchecked Sendable {
                     }
 
                     guard delivered else {
+                        // Superseded or cancelled while post-processing: this
+                        // session's recording is nobody's business now. Scoped
+                        // to its own URL — cleanup() would take the current one,
+                        // which may already belong to a newer session.
+                        self.audioRecorder.discardRecording(at: fileURL)
                         return
                     }
-                    let savedAudioFile = await Self.saveAudioFileAsync(from: fileURL).value
+                    let savedAudioFile = await Self.saveAudioFileAsync(from: fileURL, retainedBy: self.audioRecorder).value
                     await MainActor.run {
                         self.recordPipelineHistoryEntry(
                             rawTranscript: trimmedRawTranscript,
@@ -2975,7 +3281,10 @@ final class AppState: ObservableObject, @unchecked Sendable {
                             intent: sessionIntent,
                             audioFileName: savedAudioFile?.fileName
                         )
-                        self.audioRecorder.cleanup()
+                        // Scoped to this session's file: the copy above ran
+                        // after isTranscribing was cleared, so a new recording
+                        // may already own the recorder's current URL.
+                        self.audioRecorder.discardRecording(at: fileURL)
                         self.refreshAvailableMicrophonesIfNeeded()
                     }
                 } catch is CancellationError {
@@ -2990,7 +3299,7 @@ final class AppState: ObservableObject, @unchecked Sendable {
                         inFlightContextTask: inFlightContextTask,
                         sessionIntent: sessionIntent
                     )
-                    let savedAudioFile = await Self.saveAudioFileAsync(from: fileURL).value
+                    let savedAudioFile = await Self.saveAudioFileAsync(from: fileURL, retainedBy: self.audioRecorder).value
                     let recordedError = await MainActor.run {
                         guard self.isTranscribing else { return false }
                         self.transcriptionTask = nil
@@ -3020,12 +3329,16 @@ final class AppState: ObservableObject, @unchecked Sendable {
                             intent: sessionIntent,
                             audioFileName: savedAudioFile?.fileName
                         )
-                        self.audioRecorder.cleanup()
+                        self.audioRecorder.discardRecording(at: fileURL)
                         self.refreshAvailableMicrophonesIfNeeded()
                         return true
                     }
-                    if !recordedError, let savedAudioFile {
-                        Self.deleteAudioFile(savedAudioFile.fileName)
+                    if !recordedError {
+                        self.audioRecorder.discardRecording(at: fileURL)
+                        if let savedAudioFile {
+                            Self.deleteAudioFile(savedAudioFile.fileName)
+                            Self.releaseAudioFileName(savedAudioFile.fileName)
+                        }
                     }
                 }
             }
@@ -3072,21 +3385,52 @@ final class AppState: ObservableObject, @unchecked Sendable {
             contextBundleIdentifier: context.bundleIdentifier,
             contextWindowTitle: context.windowTitle
         )
-        do {
-            let removedAudioFileNames = try pipelineHistoryStore.append(newEntry, maxCount: maxPipelineHistoryCount)
-            for audioFileName in removedAudioFileNames {
-                Self.deleteAudioFile(audioFileName)
+        // Update the in-memory list in place rather than reloading the entire
+        // store (which would re-read every base64 screenshot blob from disk on
+        // each dictation). Newest entries sort to the front.
+        pipelineHistoryMutationGeneration += 1
+        pipelineHistory.insert(newEntry, at: 0)
+        if pipelineHistory.count > maxPipelineHistoryCount {
+            pipelineHistory.removeLast(pipelineHistory.count - maxPipelineHistoryCount)
+        }
+        // The insert + trim runs on the store's background queue. This is the
+        // hot path — it fires milliseconds after the transcript is pasted, and
+        // the row can carry up to 500 KB of base64 screenshot, so it must not
+        // touch the main-queue context.
+        pipelineHistoryStore.append(newEntry, maxCount: maxPipelineHistoryCount) { [weak self] result in
+            // The row has settled one way or the other: either it is committed
+            // and the file is referenced, or it failed and the file is genuinely
+            // orphaned. Either way the sweep no longer needs to spare it.
+            Self.releaseAudioFileName(audioFileName)
+            switch result {
+            case .success(let outcome):
+                for removed in outcome.droppedAudioFileNames {
+                    Self.deleteAudioFile(removed)
+                }
+                if let trimError = outcome.trimError {
+                    // The row itself is durable, so this is not a history
+                    // failure to reconcile and the audio file must stay. What it
+                    // does mean is that history is over its limit and the files
+                    // for the rows that should have been dropped are still on
+                    // disk, until the next append or the launch-time trim and
+                    // orphan sweep clear them.
+                    os_log(
+                        .error,
+                        log: recordingLog,
+                        "run history trim after append failed: %{public}@",
+                        trimError.localizedDescription
+                    )
+                }
+            case .failure(let error):
+                // The row never landed, so nothing references the copied WAV.
+                // Releasing the reservation alone would strand it on disk: the
+                // orphan sweep only runs at launch, so it would sit there —
+                // up to a few MB per failed run — until the next one.
+                if let audioFileName {
+                    Self.deleteAudioFile(audioFileName)
+                }
+                self?.reconcileHistoryAfterFailure(error, whileTrying: "Unable to save run history entry")
             }
-            // Update the in-memory list in place rather than reloading the
-            // entire store (which would re-read every base64 screenshot blob
-            // from disk on each dictation). Newest entries sort to the front.
-            pipelineHistoryMutationGeneration += 1
-            pipelineHistory.insert(newEntry, at: 0)
-            if pipelineHistory.count > maxPipelineHistoryCount {
-                pipelineHistory.removeLast(pipelineHistory.count - maxPipelineHistoryCount)
-            }
-        } catch {
-            errorMessage = "Unable to save run history entry: \(error.localizedDescription)"
         }
     }
 
@@ -3248,7 +3592,7 @@ final class AppState: ObservableObject, @unchecked Sendable {
 
     private func focusedWindowTitle(for app: NSRunningApplication?) -> String? {
         guard let app else { return nil }
-        let appElement = AXUIElementCreateApplication(app.processIdentifier)
+        let appElement = AccessibilityIPC.applicationElement(for: app.processIdentifier)
         return focusedWindowTitle(from: appElement)
     }
 
@@ -3272,7 +3616,13 @@ final class AppState: ObservableObject, @unchecked Sendable {
               CFGetTypeID(rawValue) == AXUIElementGetTypeID() else {
             return nil
         }
-        return unsafeBitCast(rawValue, to: AXUIElement.self)
+        let child = unsafeBitCast(rawValue, to: AXUIElement.self)
+        // A copied-out element is a distinct AXUIElement and does not inherit
+        // the parent's messaging timeout, so bound it here too. Without this,
+        // querying a focused window or focused UI element falls back to the
+        // 6-second system default. See AccessibilityIPC.
+        AXUIElementSetMessagingTimeout(child, AccessibilityIPC.messagingTimeout)
+        return child
     }
 
     private func accessibilityString(from element: AXUIElement, attribute: CFString) -> String? {

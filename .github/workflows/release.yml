@@ -115,6 +115,19 @@ jobs:
       - name: Build universal
         run: make ARCH=universal APP_NAME=Fluent BUNDLE_ID=com.inhaq.fluent CODESIGN_IDENTITY="$CODESIGN_IDENTITY"
 
+      # Keep the debug symbols for this build so crash reports and Instruments
+      # traces from released versions can be symbolized. Not attached to the
+      # public release — retained as a workflow artifact instead.
+      - name: Archive dSYM
+        uses: actions/upload-artifact@v4
+        with:
+          name: Fluent-${{ steps.version.outputs.version }}-dSYM
+          path: |
+            build/Fluent-arm64.dSYM
+            build/Fluent-x86_64.dSYM
+          retention-days: 90
+          if-no-files-found: warn
+
       - name: Create universal DMG
         run: make dmg ARCH=universal APP_NAME=Fluent BUNDLE_ID=com.inhaq.fluent CODESIGN_IDENTITY="$CODESIGN_IDENTITY"
 

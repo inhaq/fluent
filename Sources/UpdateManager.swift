@@ -1,5 +1,21 @@
 import Foundation
 import AppKit
+import os.log
+
+private let updateLog = OSLog(subsystem: "com.inhaq.fluent", category: "Updates")
+
+/// Thrown when `hdiutil attach` succeeded but the resulting mount could not be
+/// resolved or torn down, so a volume may still be attached.
+///
+/// The distinction matters to cleanup: deleting the backing `.dmg` out from
+/// under a live volume is what turns a leaked mount into an unreadable one, so a
+/// caller seeing this must keep the file.
+struct DiskImageMountLeak: LocalizedError {
+    let reason: String
+    var errorDescription: String? {
+        "The update disk image could not be unmounted (\(reason)). Leaving it in place."
+    }
+}
 
 // MARK: - Data Models
 
@@ -173,6 +189,11 @@ final class UpdateManager: ObservableObject {
     private let postTranscriptionReminderInterval: TimeInterval = 24 * 60 * 60 // 1 day
     private var periodicTimer: Timer?
     private var activeDownloadTask: Task<Void, Never>?
+
+    /// Identifies the current download/install operation. Bumped when one starts
+    /// and when one is cancelled, so a task that has been superseded or
+    /// cancelled can no longer write to the UI.
+    private var updateGeneration = 0
 
     private init() {
         lastCheckDate = UserDefaults.standard.object(forKey: "updateLastCheckDate") as? Date
@@ -693,6 +714,10 @@ final class UpdateManager: ObservableObject {
     // MARK: - Download and Install
 
     func cancelDownload() {
+        // Retire the generation first: the task being cancelled may not have run
+        // a single line yet, and it must not be able to write `.downloading`
+        // over the `.idle` set below.
+        updateGeneration += 1
         activeDownloadTask?.cancel()
         activeDownloadTask = nil
         downloadProgress = nil
@@ -710,27 +735,55 @@ final class UpdateManager: ObservableObject {
         guard let downloadURL = URL(string: dmgAsset.browserDownloadUrl) else { return }
 
         activeDownloadTask?.cancel()
+        updateGeneration += 1
+        let generation = updateGeneration
         activeDownloadTask = Task {
-            await performUpdate(downloadURL: downloadURL, expectedSize: dmgAsset.size)
+            await performUpdate(
+                downloadURL: downloadURL,
+                expectedSize: dmgAsset.size,
+                generation: generation
+            )
         }
     }
 
-    private func performUpdate(downloadURL: URL, expectedSize: Int) async {
+    /// Publishes status for one operation, dropping the write if that operation
+    /// has since been cancelled or superseded.
+    ///
+    /// Without this, a download cancelled between `Task` creation and its first
+    /// executed line still set `.downloading` over the `.idle` that
+    /// `cancelDownload()` had just written, leaving the UI stuck mid-download.
+    private func publish(status: UpdateStatus, generation: Int) {
+        guard generation == updateGeneration else { return }
+        updateStatus = status
+    }
+
+    /// Progress counterpart to ``publish(status:generation:)``. The byte pump
+    /// runs detached, so an old one could otherwise keep driving the progress bar
+    /// after a cancel or after a newer download had started.
+    private func publish(progress: Double?, generation: Int) {
+        guard generation == updateGeneration else { return }
+        downloadProgress = progress
+    }
+
+    private func performUpdate(downloadURL: URL, expectedSize: Int, generation: Int) async {
+        // The task may have been cancelled before it ran at all.
+        guard !Task.isCancelled, generation == updateGeneration else { return }
+
         let fm = FileManager.default
         let tempDir = fm.temporaryDirectory.appendingPathComponent("fluent-update-\(UUID().uuidString)")
 
         do {
             try fm.createDirectory(at: tempDir, withIntermediateDirectories: true)
         } catch {
-            updateStatus = .error("Failed to create temp directory: \(error.localizedDescription)")
+            publish(status: .error("Failed to create temp directory: \(error.localizedDescription)"), generation: generation)
             return
         }
 
         let dmgPath = tempDir.appendingPathComponent("Fluent.dmg")
 
         // MARK: Download phase
-        updateStatus = .downloading
-        downloadProgress = 0
+        publish(status: .downloading, generation: generation)
+        publish(progress: 0, generation: generation)
 
         do {
             var request = URLRequest(url: downloadURL)
@@ -769,9 +822,7 @@ final class UpdateManager: ObservableObject {
                         if totalSize > 0 && (now - lastProgressUpdate) >= 0.033 {
                             lastProgressUpdate = now
                             let progress = Double(receivedBytes) / Double(totalSize)
-                            await MainActor.run {
-                                mgr.downloadProgress = progress
-                            }
+                            await mgr.publish(progress: progress, generation: generation)
                         }
                     }
                 }
@@ -784,8 +835,18 @@ final class UpdateManager: ObservableObject {
                 try outputHandle.close()
             }
 
-            try await downloadTask.value
-            downloadProgress = 1.0
+            // A detached task does not inherit cancellation, and awaiting its
+            // `value` is not a cancellation point either — so without this
+            // handler, `cancelDownload()` cancelled the parent while the pump
+            // kept draining bytes, and the install stages below then ran on a
+            // download the user had already cancelled.
+            try await withTaskCancellationHandler {
+                try await downloadTask.value
+            } onCancel: {
+                downloadTask.cancel()
+            }
+            try Task.checkCancellation()
+            publish(progress: 1.0, generation: generation)
 
         } catch is CancellationError {
             try? fm.removeItem(at: tempDir)
@@ -794,56 +855,193 @@ final class UpdateManager: ObservableObject {
             try? fm.removeItem(at: tempDir)
             return
         } catch {
-            updateStatus = .error("Download failed: \(error.localizedDescription)")
-            downloadProgress = nil
+            publish(status: .error("Download failed: \(error.localizedDescription)"), generation: generation)
+            publish(progress: nil, generation: generation)
             try? fm.removeItem(at: tempDir)
             return
         }
 
         // MARK: Install phase - mount DMG, extract app
-        updateStatus = .installing
-        downloadProgress = nil
+        publish(status: .installing, generation: generation)
+        publish(progress: nil, generation: generation)
+
+        // tempDir holds the .dmg. While a volume from it is still attached,
+        // removing the directory would leave a mounted volume backed by a
+        // deleted file — so every exit path, including the error paths, must
+        // consult this before cleaning up. It stays true when nothing was ever
+        // mounted (e.g. mountDMG itself failed).
+        var tempDirIsSafeToRemove = true
 
         do {
-            let mountPoint = try await Task.detached {
-                try self.mountDMG(at: dmgPath)
-            }.value
+            // Each stage from here on is harder to undo than the last, and the
+            // final one moves the running app aside and terminates the process.
+            // So every boundary re-checks: `cancelDownload()` can land at any
+            // point, and the user cancelling an update must not end with a
+            // relaunch into it.
+            try Task.checkCancellation()
 
-            defer {
-                // Always try to detach
-                let detach = Process()
-                detach.executableURL = URL(fileURLWithPath: "/usr/bin/hdiutil")
-                detach.arguments = ["detach", mountPoint, "-quiet"]
-                try? detach.run()
-                detach.waitUntilExit()
+            let mountPoint: String
+            do {
+                mountPoint = try await Task.detached {
+                    try self.mountDMG(at: dmgPath)
+                }.value
+            } catch let leak as DiskImageMountLeak {
+                // A volume may still be backed by the .dmg in tempDir. Keep the
+                // directory: an unreadable mount is worse than wasted disk.
+                tempDirIsSafeToRemove = false
+                throw leak
             }
 
-            // Find the .app inside the mounted volume
-            let volumeURL = URL(fileURLWithPath: mountPoint)
-            let contents = try fm.contentsOfDirectory(at: volumeURL, includingPropertiesForKeys: nil)
-            guard let appBundle = contents.first(where: { $0.pathExtension == "app" }) else {
-                updateStatus = .error("No .app found in DMG.")
-                try? fm.removeItem(at: tempDir)
+            // `hdiutil attach` cannot be interrupted mid-flight, so a cancel
+            // during the mount only surfaces here — with a volume attached that
+            // has to come back down before the temp dir can go.
+            if Task.isCancelled {
+                tempDirIsSafeToRemove = await detachDMGAndWait(at: mountPoint)
+                removeTempDir(tempDir, ifSafe: tempDirIsSafeToRemove)
                 return
             }
 
-            // Copy app to staging directory
-            let stagingDir = fm.temporaryDirectory.appendingPathComponent("fluent-staged-\(UUID().uuidString)")
-            try fm.createDirectory(at: stagingDir, withIntermediateDirectories: true)
-            let stagedApp = stagingDir.appendingPathComponent(appBundle.lastPathComponent)
-            try fm.copyItem(at: appBundle, to: stagedApp)
+            // Detachment must complete *before* the temp dir is removed and
+            // before replaceAndRelaunch, which calls NSApp.terminate and does
+            // not return. A `defer` cannot be used here: defers cannot await,
+            // and a fire-and-forget Task.detached would lose the race against
+            // process exit, leaving the volume mounted.
+            let stagedApp: URL?
+            do {
+                stagedApp = try stageAppBundle(fromVolumeAt: mountPoint)
+            } catch {
+                tempDirIsSafeToRemove = await detachDMGAndWait(at: mountPoint)
+                throw error
+            }
 
-            // Clean up DMG (detach happens in defer above, delete temp dir)
-            try? fm.removeItem(at: tempDir)
+            tempDirIsSafeToRemove = await detachDMGAndWait(at: mountPoint)
+            removeTempDir(tempDir, ifSafe: tempDirIsSafeToRemove)
+
+            // The volume is still attached. replaceAndRelaunch terminates this
+            // process, and nothing after that will ever take it down — so the
+            // install stops here rather than stranding a mounted image, and the
+            // staged copy goes with it.
+            guard tempDirIsSafeToRemove else {
+                if let stagedApp {
+                    try? fm.removeItem(at: stagedApp.deletingLastPathComponent())
+                }
+                publish(
+                    status: .error("The update disk image could not be unmounted. The update was not installed."),
+                    generation: generation
+                )
+                return
+            }
+
+            guard let stagedApp else {
+                publish(status: .error("No .app found in DMG."), generation: generation)
+                return
+            }
+
+            // Point of no return: replaceAndRelaunch swaps the app bundle and
+            // calls NSApp.terminate. Nothing after it can be undone, so this is
+            // the last chance to honour a cancel.
+            if Task.isCancelled {
+                try? fm.removeItem(at: stagedApp.deletingLastPathComponent())
+                return
+            }
 
             // MARK: Replace & relaunch
-            updateStatus = .readyToRelaunch
-            replaceAndRelaunch(stagedApp: stagedApp, stagingDir: stagingDir)
+            publish(status: .readyToRelaunch, generation: generation)
+            replaceAndRelaunch(stagedApp: stagedApp, stagingDir: stagedApp.deletingLastPathComponent())
 
+        } catch is CancellationError {
+            // cancelDownload() already reset the status; surfacing an error here
+            // would contradict it.
+            removeTempDir(tempDir, ifSafe: tempDirIsSafeToRemove)
         } catch {
-            updateStatus = .error("Install failed: \(error.localizedDescription)")
-            try? fm.removeItem(at: tempDir)
+            publish(status: .error("Install failed: \(error.localizedDescription)"), generation: generation)
+            removeTempDir(tempDir, ifSafe: tempDirIsSafeToRemove)
         }
+    }
+
+    /// Removes the download temp directory, unless a volume backed by the `.dmg`
+    /// inside it is still attached. The staged app has already been copied out by
+    /// this point, so keeping the directory only costs disk until logout.
+    private func removeTempDir(_ tempDir: URL, ifSafe isSafe: Bool) {
+        guard isSafe else {
+            os_log(
+                .error,
+                log: updateLog,
+                "Leaving %{public}@ in place: DMG did not detach",
+                tempDir.path
+            )
+            return
+        }
+        try? FileManager.default.removeItem(at: tempDir)
+    }
+
+    /// Copies the `.app` out of a mounted DMG into a fresh staging directory.
+    /// Returns `nil` if the volume contains no app bundle. The caller is
+    /// responsible for detaching the volume afterwards.
+    private func stageAppBundle(fromVolumeAt mountPoint: String) throws -> URL? {
+        let fm = FileManager.default
+        let volumeURL = URL(fileURLWithPath: mountPoint)
+        let contents = try fm.contentsOfDirectory(at: volumeURL, includingPropertiesForKeys: nil)
+        guard let appBundle = contents.first(where: { $0.pathExtension == "app" }) else {
+            return nil
+        }
+        let stagingDir = fm.temporaryDirectory.appendingPathComponent("fluent-staged-\(UUID().uuidString)")
+        try fm.createDirectory(at: stagingDir, withIntermediateDirectories: true)
+        let stagedApp = stagingDir.appendingPathComponent(appBundle.lastPathComponent)
+        do {
+            try fm.copyItem(at: appBundle, to: stagedApp)
+        } catch {
+            // Only the caller's `stagedApp` URL ever leads back to this
+            // directory, and on a throw the caller never gets one — so a failed
+            // copy would strand the staging directory, holding a partial (or
+            // very nearly complete) app bundle, until logout.
+            try? fm.removeItem(at: stagingDir)
+            throw error
+        }
+        return stagedApp
+    }
+
+    /// Detaches a mounted DMG and waits for `hdiutil` to finish, without
+    /// blocking the main actor. Returns whether the volume actually detached.
+    private func detachDMGAndWait(at mountPoint: String) async -> Bool {
+        await Task.detached { Self.detachDMG(at: mountPoint) }.value
+    }
+
+    /// Unmounts a DMG. `nonisolated` and `static` so it can never be scheduled
+    /// onto the main actor by inheriting isolation from a caller.
+    ///
+    /// Returns `false` if `hdiutil` could not be launched or exited non-zero —
+    /// the caller must not then treat the volume as gone, because deleting the
+    /// backing `.dmg` out from under a still-attached volume is what turns a
+    /// leaked mount into an unreadable one.
+    nonisolated private static func detachDMG(at mountPoint: String) -> Bool {
+        let detach = Process()
+        detach.executableURL = URL(fileURLWithPath: "/usr/bin/hdiutil")
+        detach.arguments = ["detach", mountPoint, "-quiet"]
+        do {
+            try detach.run()
+        } catch {
+            os_log(
+                .error,
+                log: updateLog,
+                "hdiutil detach could not be launched for %{public}@: %{public}@",
+                mountPoint,
+                error.localizedDescription
+            )
+            return false
+        }
+        detach.waitUntilExit()
+        guard detach.terminationStatus == 0 else {
+            os_log(
+                .error,
+                log: updateLog,
+                "hdiutil detach failed for %{public}@ with exit code %d",
+                mountPoint,
+                detach.terminationStatus
+            )
+            return false
+        }
+        return true
     }
 
     nonisolated private func mountDMG(at path: URL) throws -> String {
@@ -866,21 +1064,37 @@ final class UpdateManager: ObservableObject {
 
         let data = pipe.fileHandleForReading.readDataToEndOfFile()
 
-        // Parse the plist output to find mount point
-        guard let plist = try PropertyListSerialization.propertyList(from: data, format: nil) as? [String: Any],
+        // Past this point a volume *is* attached, so every failure below has to
+        // either take it back down or say out loud that it could not — throwing
+        // a bare error would leave the caller believing nothing was mounted and
+        // free to delete the .dmg underneath it.
+        guard let plist = try? PropertyListSerialization.propertyList(from: data, format: nil) as? [String: Any],
               let entities = plist["system-entities"] as? [[String: Any]] else {
-            throw NSError(domain: "UpdateManager", code: 2, userInfo: [
-                NSLocalizedDescriptionKey: "Could not parse hdiutil output"
-            ])
+            throw DiskImageMountLeak(reason: "hdiutil attach output could not be parsed")
         }
 
-        // Find the mount point from the entities
-        for entity in entities {
-            if let mountPoint = entity["mount-point"] as? String {
-                return mountPoint
-            }
+        if let mountPoint = entities.compactMap({ $0["mount-point"] as? String }).first {
+            return mountPoint
         }
 
+        // Attached, but nothing is mounted at a path we can use. Take the image
+        // back down by device entry so it does not outlive this call.
+        //
+        // Shortest entry first, and stop at the first success: hdiutil reports
+        // the whole disk (/dev/disk4) alongside each of its slices
+        // (/dev/disk4s1), and detaching the whole disk takes the slices with it —
+        // after which detaching a slice fails because it no longer exists.
+        // Requiring every entry to detach reported a leak for an image that was
+        // already fully detached, which would strand the temp dir for good.
+        let deviceEntries = entities
+            .compactMap { $0["dev-entry"] as? String }
+            .sorted { $0.count < $1.count }
+        guard deviceEntries.contains(where: { Self.detachDMG(at: $0) }) else {
+            throw DiskImageMountLeak(reason: "no mount point in hdiutil attach output, and the image could not be detached")
+        }
+
+        // Detached cleanly: nothing is attached now, so this is an ordinary
+        // failure and the caller may delete the .dmg.
         throw NSError(domain: "UpdateManager", code: 3, userInfo: [
             NSLocalizedDescriptionKey: "No mount point found in hdiutil output"
         ])
@@ -897,7 +1111,7 @@ final class UpdateManager: ObservableObject {
         let script = """
         while kill -0 "$1" 2>/dev/null; do sleep 0.2; done
         mv "$2" "$5" && mv "$3" "$2" && open "$2" && rm -rf "$4" "$5" \
-            || { mv "$5" "$2" 2>/dev/null; exit 1; }
+            || { mv "$5" "$2" 2>/dev/null; rm -rf "$4"; exit 1; }
         """
 
         let process = Process()

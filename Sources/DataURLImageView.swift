@@ -10,6 +10,11 @@ final class DataURLImageCache {
 
     private init() {
         cache.countLimit = 32
+        // Bound by bytes as well as count. A 768px screenshot decodes to
+        // 768*768*4 ≈ 2.4 MB, so 32 of them is ~75 MB resident — far too much
+        // for a menu bar utility, and NSCache cannot evict sensibly without a
+        // per-object cost to weigh.
+        cache.totalCostLimit = 24 * 1024 * 1024
     }
 
     func image(forKey key: String) -> NSImage? {
@@ -17,7 +22,25 @@ final class DataURLImageCache {
     }
 
     func store(_ image: NSImage, forKey key: String) {
-        cache.setObject(image, forKey: key as NSString)
+        // The full `data:` URL is the key. An earlier version abbreviated it to
+        // "length:prefix…suffix" to avoid retaining a copy, but that is not
+        // collision-free: the prefix of a JPEG data URL is a near-constant
+        // header, so the key reduced to (exact encoded length, last ~24 bytes).
+        // Two screenshots of the same UI at the same dimensions and quality can
+        // match on both, and the failure mode is showing the user someone
+        // else's screenshot in the run log. Not a trade worth making for a
+        // lookup that happens once per view appearance.
+        //
+        // Cost covers the decoded bitmap *and* the retained key, so
+        // totalCostLimit bounds the whole footprint rather than just the images.
+        let pixels = image.representations.reduce(0) { $0 + $1.pixelsWide * $1.pixelsHigh }
+        let cost = max(pixels * 4 + key.utf8.count, 1)
+        cache.setObject(image, forKey: key as NSString, cost: cost)
+    }
+
+    /// Drops every decoded image. Called on memory pressure.
+    func removeAll() {
+        cache.removeAllObjects()
     }
 }
 
@@ -79,9 +102,19 @@ final class DataURLImageLoader: ObservableObject {
         // hundreds-of-KB screenshot is the work we want off the main thread.
         // (`NSImage` only conforms to `Sendable` on macOS 14+, so we avoid
         // returning it across the concurrency boundary on the macOS 13 target.)
-        let decodedData = await Task.detached(priority: .userInitiated) {
-            base64ImageData(fromDataURL: dataURL)
-        }.value
+        // A detached task does not inherit cancellation, so scrolling the run
+        // log would leave a queue of decodes for rows that are already gone,
+        // each burning a core on a screenshot nobody will see. Forwarding the
+        // cancellation lets a queued decode drop out before it starts.
+        let decode = Task.detached(priority: .userInitiated) { () -> Data? in
+            guard !Task.isCancelled else { return nil }
+            return base64ImageData(fromDataURL: dataURL)
+        }
+        let decodedData = await withTaskCancellationHandler {
+            await decode.value
+        } onCancel: {
+            decode.cancel()
+        }
 
         // Guard against the dataURL changing while we were decoding.
         guard !Task.isCancelled else { return }

@@ -111,6 +111,11 @@ final class GlobalShortcutBackend {
             }
         }
         thread.name = "\(AppName.displayName) Global Shortcut Event Tap"
+        // This thread services the system-wide input path: every keystroke on
+        // the machine passes through its run loop before delivery. A default
+        // QoS thread can be scheduled onto efficiency cores, which adds
+        // keystroke latency in every app and risks the tap timing out.
+        thread.qualityOfService = .userInteractive
         eventTapThread = thread
         thread.start()
         startupSemaphore.wait()

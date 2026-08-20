@@ -3,3 +3,9 @@ build/
 *.swp
 .env
 .build
+
+# Serena workspace metadata. Excluded by default per code review. Serena's own
+# .serena/.gitignore treats project.yml as versionable, so if the team wants the
+# project config tracked, drop this line and commit .serena/project.yml and
+# .serena/.gitignore only (cache/ and project.local.yml stay local).
+.serena/

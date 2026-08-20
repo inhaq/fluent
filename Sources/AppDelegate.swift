@@ -4,9 +4,11 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     let appState = AppState()
     var setupWindow: NSWindow?
     private var settingsWindow: NSWindow?
+    private var memoryPressureSource: DispatchSourceMemoryPressure?
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         NetworkMonitor.shared.start()
+        startMemoryPressureMonitoring()
 
         NotificationCenter.default.addObserver(
             self,
@@ -35,6 +37,22 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             }
         }
 
+    }
+
+    /// Drops caches when the system reports memory pressure. Fluent sits in the
+    /// menu bar all day holding decoded screenshot bitmaps and a Core Data row
+    /// cache; releasing them on demand keeps it from being the process the
+    /// system compresses first.
+    private func startMemoryPressureMonitoring() {
+        let source = DispatchSource.makeMemoryPressureSource(
+            eventMask: [.warning, .critical],
+            queue: .main
+        )
+        source.setEventHandler { [weak self] in
+            self?.appState.releaseCachedMemory()
+        }
+        source.activate()
+        memoryPressureSource = source
     }
 
     func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows flag: Bool) -> Bool {

@@ -77,6 +77,24 @@ final class RecordingOverlayManager {
     private let overlayState = RecordingOverlayState()
     private var lockedOverlayWidth: CGFloat?
 
+    /// Everything ``makeOverlayContent`` bakes into the hosting view at
+    /// construction time. When this is unchanged across a phase transition the
+    /// existing `NSHostingView` is reused, so SwiftUI diffs `overlayState.phase`
+    /// and the `.transition`/`.animation` modifiers the views declare actually
+    /// run. Replacing the hosting view every time tore down the whole SwiftUI
+    /// graph 3–4 times per dictation *and* silently discarded those animations,
+    /// because a fresh hosting view has no previous state to interpolate from.
+    private struct HostedLayout: Equatable {
+        let isWinged: Bool
+        let width: CGFloat
+        let height: CGFloat
+        let notchWidth: CGFloat
+        let cornerRadius: CGFloat
+        let topInset: CGFloat
+    }
+
+    private var hostedLayout: HostedLayout?
+
     var onStopButtonPressed: (() -> Void)?
     var onUpdateOverlayPressed: (() -> Void)?
 
@@ -252,7 +270,7 @@ final class RecordingOverlayManager {
 
         if let panel = overlayWindow {
             panel.ignoresMouseEvents = !overlayAcceptsMouseEvents
-            panel.contentView = makeOverlayContent(frame: frame)
+            installContentIfNeeded(in: panel, frame: frame)
             resize(panel: panel, to: frame, animated: animatedResize)
             panel.alphaValue = 1
             panel.orderFrontRegardless()
@@ -262,7 +280,7 @@ final class RecordingOverlayManager {
         let panel = makeOverlayPanel(width: frame.width, height: frame.height)
         panel.hasShadow = false
         panel.ignoresMouseEvents = !overlayAcceptsMouseEvents
-        panel.contentView = makeOverlayContent(frame: frame)
+        installContentIfNeeded(in: panel, frame: frame)
 
         guard let screen = targetScreen else { return }
 
@@ -284,8 +302,31 @@ final class RecordingOverlayManager {
         guard let panel = overlayWindow else { return }
         let frame = overlayFrame
         panel.ignoresMouseEvents = !overlayAcceptsMouseEvents
-        panel.contentView = makeOverlayContent(frame: frame)
+        installContentIfNeeded(in: panel, frame: frame)
         resize(panel: panel, to: frame, animated: animated)
+    }
+
+    /// Mounts a fresh hosting view only when the baked-in layout actually
+    /// changes — e.g. winged (recording) to pill (error toast). A phase change
+    /// within the same layout leaves the hosting view alone so SwiftUI can
+    /// animate it.
+    private func installContentIfNeeded(in panel: NSPanel, frame: NSRect) {
+        let layout = currentLayout(frame: frame)
+        guard hostedLayout != layout || panel.contentView == nil else { return }
+        panel.contentView = makeOverlayContent(layout: layout)
+        hostedLayout = layout
+    }
+
+    private func currentLayout(frame: NSRect) -> HostedLayout {
+        let winged = useWingedLayout
+        return HostedLayout(
+            isWinged: winged,
+            width: frame.width,
+            height: frame.height,
+            notchWidth: winged ? notchWidth : 0,
+            cornerRadius: winged ? 14 : (screenHasNotch ? 18 : 12),
+            topInset: winged ? 0 : (screenHasNotch ? notchOverlap : 0)
+        )
     }
 
     private func setTranscribingPhase() {
@@ -294,43 +335,44 @@ final class RecordingOverlayManager {
         showOverlayPanel(animatedResize: true)
     }
 
-    private func makeOverlayContent(frame: NSRect) -> NSView {
-        if useWingedLayout {
+    /// Builds the hosting view for `layout`. The concrete root view types are
+    /// passed through to the generic `makeNotchContent` rather than wrapped in
+    /// `AnyView`: SwiftUI cannot see through `AnyView` for structural identity,
+    /// so the erasure invalidated the entire subtree on every state change.
+    private func makeOverlayContent(layout: HostedLayout) -> NSView {
+        if layout.isWinged {
             // Winged layout: notch x-range stays solid black so the cutout masks it.
-            let rootView = WingedRecordingView(
-                state: overlayState,
-                leftWingWidth: Self.leftWingWidth,
-                notchWidth: notchWidth,
-                rightWingWidth: Self.rightWingWidth,
-                height: frame.height,
-                onStopButtonPressed: { [weak self] in
-                    self?.onStopButtonPressed?()
-                }
-            )
             return makeNotchContent(
-                width: frame.width,
-                height: frame.height,
-                cornerRadius: 14,
-                rootView: AnyView(rootView)
+                width: layout.width,
+                height: layout.height,
+                cornerRadius: layout.cornerRadius,
+                rootView: WingedRecordingView(
+                    state: overlayState,
+                    leftWingWidth: Self.leftWingWidth,
+                    notchWidth: layout.notchWidth,
+                    rightWingWidth: Self.rightWingWidth,
+                    height: layout.height,
+                    onStopButtonPressed: { [weak self] in
+                        self?.onStopButtonPressed?()
+                    }
+                )
             )
         }
 
         return makeNotchContent(
-            width: frame.width,
-            height: frame.height,
-            cornerRadius: screenHasNotch ? 18 : 12,
-            rootView: AnyView(
-                RecordingOverlayView(
-                    state: overlayState,
-                    onStopButtonPressed: { [weak self] in
-                        self?.onStopButtonPressed?()
-                    },
-                    onUpdateOverlayPressed: { [weak self] in
-                        self?.onUpdateOverlayPressed?()
-                    }
-                )
-                .padding(.top, screenHasNotch ? notchOverlap : 0)
+            width: layout.width,
+            height: layout.height,
+            cornerRadius: layout.cornerRadius,
+            rootView: RecordingOverlayView(
+                state: overlayState,
+                onStopButtonPressed: { [weak self] in
+                    self?.onStopButtonPressed?()
+                },
+                onUpdateOverlayPressed: { [weak self] in
+                    self?.onUpdateOverlayPressed?()
+                }
             )
+            .padding(.top, layout.topInset)
         )
     }
 
@@ -470,6 +512,7 @@ final class RecordingOverlayManager {
             panel.contentView = nil
             panel.close()
             overlayWindow = nil
+            hostedLayout = nil
         }
     }
 }
