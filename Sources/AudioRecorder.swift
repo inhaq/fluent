@@ -43,6 +43,122 @@ struct AudioDevice: Identifiable {
     }
 }
 
+/// Stateful first-order 80 Hz high-pass filter applied incrementally, one
+/// capture buffer at a time.
+///
+/// Implements `y[n] = alpha * (y[n-1] + x[n] - x[n-1])` — the same recurrence
+/// as the whole-file pass in ``AudioRecorder/applyHighPass(to:frames:alpha:)``
+/// — but carries the previous two inputs and outputs across calls so the
+/// concatenated per-buffer output matches the whole-file result. The vectorized
+/// form uses `vDSP_deq22`, which reads its two samples of history from the head
+/// of the input/output arrays; each call seeds those slots with the carried
+/// state (the very first call after ``reset()`` seeds the same way the
+/// whole-file path does: x[-1] = first sample, y[-1] = 0).
+///
+/// Scratch buffers grow to the largest chunk seen and are then reused — capture
+/// callbacks fire ~100×/sec and must not allocate. Instances are not
+/// thread-safe: use one per serial queue.
+struct StreamingHighPassFilter {
+    private let alpha: Float
+    private var previousInput0: Float = 0 // x[-1]
+    private var previousInput1: Float = 0 // x[-2]
+    private var previousOutput0: Float = 0 // y[-1]
+    private var previousOutput1: Float = 0 // y[-2]
+    private var inputScratch: [Float] = []
+    private var outputScratch: [Float] = []
+    private var hasProcessedAnyChunk = false
+
+    init(cutoffHz: Float, sampleRate: Float) {
+        let rc = 1 / (2 * Float.pi * cutoffHz)
+        let dt = 1 / sampleRate
+        alpha = rc / (rc + dt)
+    }
+
+    mutating func reset() {
+        previousInput0 = 0
+        previousInput1 = 0
+        previousOutput0 = 0
+        previousOutput1 = 0
+        hasProcessedAnyChunk = false
+    }
+
+    /// Filters `frameCount` samples in place.
+    mutating func applyInPlace(_ samples: UnsafeMutablePointer<Float>, frameCount: Int) {
+        guard frameCount > 0 else { return }
+        if inputScratch.count < frameCount + 2 {
+            inputScratch = [Float](repeating: 0, count: frameCount + 2)
+            outputScratch = [Float](repeating: 0, count: frameCount + 2)
+        }
+
+        let coefficients: [Float] = [alpha, -alpha, 0, -alpha, 0]
+
+        inputScratch.withUnsafeMutableBufferPointer { input in
+            outputScratch.withUnsafeMutableBufferPointer { output in
+                input.baseAddress!.advanced(by: 2).update(from: samples, count: frameCount)
+                if hasProcessedAnyChunk {
+                    input[0] = previousInput1
+                    input[1] = previousInput0
+                    output[0] = previousOutput1
+                    output[1] = previousOutput0
+                } else {
+                    // First chunk ever: match the whole-file path's initial
+                    // conditions exactly (x[-1] = x[0], y[-1] = 0).
+                    input[0] = input[2]
+                    input[1] = input[2]
+                    output[0] = 0
+                    output[1] = 0
+                }
+                vDSP_deq22(
+                    input.baseAddress!, 1,
+                    coefficients.withUnsafeBufferPointer { $0.baseAddress! },
+                    output.baseAddress!, 1,
+                    vDSP_Length(frameCount)
+                )
+                samples.update(from: output.baseAddress!.advanced(by: 2), count: frameCount)
+                previousInput0 = input[frameCount + 1]
+                previousInput1 = input[frameCount]
+                previousOutput0 = output[frameCount + 1]
+                previousOutput1 = output[frameCount]
+            }
+        }
+        hasProcessedAnyChunk = true
+    }
+}
+
+/// Int16-domain application of ``StreamingHighPassFilter`` for the recording
+/// file writer: Int16 → Float scratch → filter → rounded/clipped back to Int16.
+///
+/// The recording file is Int16 (`recordingTargetFormat`), while the filter runs
+/// in Float, so every chunk makes one scratch round-trip. The float scratch is
+/// caller-owned and grows geometrically; no steady-state allocations. Rounding
+/// uses `vDSP_vfixr16` (round-to-nearest) to track what AVAudioFile's own
+/// float→Int16 conversion would have produced.
+enum FileAudioHighPass {
+    static func applyToInt16(
+        _ source: UnsafePointer<Int16>,
+        destination: UnsafeMutablePointer<Int16>,
+        frameCount: Int,
+        filter: inout StreamingHighPassFilter,
+        floatScratch: inout [Float]
+    ) {
+        guard frameCount > 0 else { return }
+        if floatScratch.count < frameCount {
+            floatScratch = [Float](repeating: 0, count: frameCount)
+        }
+        vDSP_vflt16(source, 1, &floatScratch, 1, vDSP_Length(frameCount))
+        floatScratch.withUnsafeMutableBufferPointer { scratch in
+            filter.applyInPlace(scratch.baseAddress!, frameCount: frameCount)
+        }
+        // Clip before conversion so an out-of-range sample can never wrap.
+        var lower: Float = -32_768
+        var upper: Float = 32_767
+        floatScratch.withUnsafeMutableBufferPointer { scratch in
+            vDSP_vclip(scratch.baseAddress!, 1, &lower, &upper, scratch.baseAddress!, 1, vDSP_Length(frameCount))
+            vDSP_vfixr16(scratch.baseAddress!, 1, destination, 1, vDSP_Length(frameCount))
+        }
+    }
+}
+
 enum AudioRecorderError: LocalizedError {
     case invalidInputFormat(String)
     case missingInputDevice
@@ -67,6 +183,34 @@ enum AudioRecorderError: LocalizedError {
             return "Could not begin recording audio: \(details)"
         }
     }
+}
+
+/// Lifecycle of the capture session. All reads/writes happen on
+/// `sessionQueue`.
+///
+/// - `noSession`: nothing retained.
+/// - `configuredStopped`: a fully configured session retained from the previous
+///   dictation, stopped. The microphone hardware is not running (verified:
+///   `kAudioDevicePropertyDeviceIsRunningSomewhere` stays false, so the system
+///   mic indicator stays dark), but every expensive step except
+///   `startRunning()` is already done. The next dictation pays only that call
+///   (~40 ms measured) instead of rebuilding the whole session (~235 ms).
+/// - `runningPrewarm`: the opt-in pre-warm feature — an idle session left
+///   *running* so even `startRunning()` is skipped. Auto-cools down after
+///   ``prewarmIdleTimeout`` because it keeps the mic indicator lit.
+/// - `recording`: an active dictation owns the session.
+/// - `interrupted`: recording was active and the system interrupted capture;
+///   recovery resumes recording when the interruption ends.
+///
+/// There is deliberately no "invalid" case: a poisoned retained session (idle
+/// runtime error, idle interruption) is torn down immediately, landing on
+/// `.noSession` — the next trigger rebuilds from scratch.
+private enum CaptureSessionState {
+    case noSession
+    case configuredStopped
+    case runningPrewarm
+    case recording
+    case interrupted
 }
 
 /// Records microphone input to a normalized 16 kHz mono PCM16 WAV.
@@ -95,6 +239,12 @@ final class AudioRecorder: NSObject, ObservableObject, AVCaptureAudioDataOutputS
     private let _bufferCount = OSAllocatedUnfairLock(initialState: 0)
     private let fileWriteErrorLock = OSAllocatedUnfairLock(initialState: ())
     private var watchdogTimer: DispatchSourceTimer?
+    // Lifecycle of the retained capture session. Guarded by sessionQueue.
+    private var captureSessionState: CaptureSessionState = .noSession
+    /// Identity of the session the currently-installed observers belong to.
+    /// Guarded by sessionQueue; lets queued notifications from a replaced
+    /// session be recognized and dropped instead of acting on a newer one.
+    private var currentSessionIdentity: ObjectIdentifier?
     // Explicit QoS on both capture queues. A queue created without `qos:` gets
     // .unspecified and infers priority from whoever enqueues — which for the
     // sample-buffer queue is AVFoundation, and on Apple Silicon that can land
@@ -114,7 +264,6 @@ final class AudioRecorder: NSObject, ObservableObject, AVCaptureAudioDataOutputS
     private var recordedFrameCount: AVAudioFramePosition = 0
     private var loggedCaptureFormat = false
     private var fileWriteError: Error?
-    private var isSessionInterrupted = false
     // Cached source format for the active capture session. Building an
     // AVAudioFormat from the sample buffer's format description on every
     // callback (~100x/sec) is wasteful; the format is constant for the
@@ -122,10 +271,8 @@ final class AudioRecorder: NSObject, ObservableObject, AVCaptureAudioDataOutputS
     private var cachedSourceFormatDescription: CMFormatDescription?
     private var cachedSourceFormat: AVAudioFormat?
     // UID of the device the current capture session is configured for. Lets the
-    // recording path reuse a pre-warmed session only when the device matches.
+    // recording path reuse a retained session only when the device matches.
     private var currentDeviceUID: String?
-    // True while an idle session is kept running ahead of recording (prewarm).
-    private var isPrewarmed = false
     private var prewarmCooldownTimer: DispatchSourceTimer?
     private static let prewarmIdleTimeout: TimeInterval = 20.0
     // Reusable Float scratch for integer -> float conversion in rmsLevel.
@@ -133,6 +280,18 @@ final class AudioRecorder: NSObject, ObservableObject, AVCaptureAudioDataOutputS
     // allocated (and zero-filled) a fresh [Float] on every one. Only ever
     // touched on sampleBufferQueue, which is serial.
     private var floatScratch: [Float] = []
+    // High-pass filtering of file-bound audio happens incrementally during
+    // capture (see appendDecodedBufferToFile) so the stop path no longer pays a
+    // full-file filter pass. State lives here; both are only ever touched on
+    // sampleBufferQueue (filter) or sessionQueue before recording starts
+    // (reset), with reset ordered before _recording goes live.
+    private var fileHighPassFilter = StreamingHighPassFilter(cutoffHz: 80, sampleRate: 16_000)
+    private var fileHighPassFloatScratch: [Float] = []
+    /// Whether every file-bound buffer of the current recording was actually
+    /// high-passed. Set false by any bypass path (copy allocation failure,
+    /// missing channel data) so the enhancement stage knows to run the
+    /// whole-file filter instead of trusting an unfiltered recording.
+    private let fileHighPassSucceededLock = OSAllocatedUnfairLock(initialState: true)
     // Throttle state for publishing the live audio level to the UI.
     private var lastAudioLevelPublish: CFAbsoluteTime = 0
     private static let audioLevelPublishInterval: CFTimeInterval = 1.0 / 30.0
@@ -144,6 +303,11 @@ final class AudioRecorder: NSObject, ObservableObject, AVCaptureAudioDataOutputS
 
     var onRecordingReady: (() -> Void)?
     var onRecordingFailure: ((Error) -> Void)?
+    /// Fires once per successful ``startRecording`` — on `sessionQueue`, before
+    /// ``startRecording`` returns — with whether an existing retained session
+    /// was reused (`true`) or freshly built (`false`). The owner uses this for
+    /// pipeline signposts. Reset by callers alongside the other callbacks.
+    var onSessionPrepared: ((_ reusedExistingSession: Bool) -> Void)?
     /// Fires on the sample-buffer queue with a 24 kHz mono PCM16 chunk for
     /// each incoming audio buffer (matching OpenAI Realtime's default PCM
     /// input rate). Set before ``startRecording`` to stream audio out-of-band
@@ -255,6 +419,13 @@ final class AudioRecorder: NSObject, ObservableObject, AVCaptureAudioDataOutputS
     private func installSessionObservers(for session: AVCaptureSession) {
         removeSessionObservers()
 
+        // Scope every observer to the session instance it was installed for.
+        // Notifications can already be queued when a newer session takes over
+        // (retained-session reuse makes that window real); without this check
+        // a stale runtime error would tear down or fail the NEWER recording.
+        let sessionIdentity = ObjectIdentifier(session)
+        currentSessionIdentity = sessionIdentity
+
         let runtimeObserver = NotificationCenter.default.addObserver(
             forName: AVCaptureSession.runtimeErrorNotification,
             object: session,
@@ -263,7 +434,7 @@ final class AudioRecorder: NSObject, ObservableObject, AVCaptureAudioDataOutputS
             let error = notification.userInfo?[AVCaptureSessionErrorKey] as? NSError
             let wrapped = error.map { AudioRecorderError.failedToStartCaptureSession($0.localizedDescription) }
                 ?? AudioRecorderError.failedToStartCaptureSession("Unknown runtime error")
-            self?.reportRecordingFailure(wrapped)
+            self?.handleRuntimeError(wrapped, fromSession: sessionIdentity)
         }
         sessionObservers.append(runtimeObserver)
 
@@ -272,7 +443,7 @@ final class AudioRecorder: NSObject, ObservableObject, AVCaptureAudioDataOutputS
             object: session,
             queue: nil
         ) { [weak self] notification in
-            self?.handleSessionInterrupted(notification)
+            self?.handleSessionInterrupted(notification, fromSession: sessionIdentity)
         }
         sessionObservers.append(interruptionObserver)
 
@@ -281,7 +452,7 @@ final class AudioRecorder: NSObject, ObservableObject, AVCaptureAudioDataOutputS
             object: session,
             queue: nil
         ) { [weak self] notification in
-            self?.handleSessionInterruptionEnded(notification)
+            self?.handleSessionInterruptionEnded(notification, fromSession: sessionIdentity)
         }
         sessionObservers.append(interruptionEndedObserver)
     }
@@ -295,8 +466,7 @@ final class AudioRecorder: NSObject, ObservableObject, AVCaptureAudioDataOutputS
 
     private func teardownSessionLocked() {
         removeSessionObservers()
-        isSessionInterrupted = false
-        isPrewarmed = false
+        currentSessionIdentity = nil
         currentDeviceUID = nil
 
         audioDataOutput?.setSampleBufferDelegate(nil, queue: nil)
@@ -307,6 +477,51 @@ final class AudioRecorder: NSObject, ObservableObject, AVCaptureAudioDataOutputS
         captureSession = nil
         currentInput = nil
         audioDataOutput = nil
+        cancelPrewarmCooldownLocked()
+        captureSessionState = .noSession
+    }
+
+    /// Transitions a finished recording (or an active pre-warm) into the
+    /// retained idle state: stopped but fully configured, so the next dictation
+    /// pays only `startRunning()`.
+    ///
+    /// Observers and the output delegate stay attached — the system mic
+    /// indicator is driven by whether the device is running, which it is not in
+    /// this state, and idle runtime errors are handled silently by
+    /// ``handleRuntimeError(_:)``. Nothing here may surface user-visible
+    /// failures: no recording is in progress.
+    private func retireSessionToConfiguredStopLocked() {
+        cancelWatchdog()
+        if let session = captureSession, session.isRunning {
+            session.stopRunning()
+        }
+        captureSessionState = .configuredStopped
+    }
+
+    /// A runtime error while a recording is active fails that recording.
+    ///
+    /// While idle (`configuredStopped`/`runningPrewarm`), the same error only
+    /// means the retained session is unusable: tear it down silently and let
+    /// the next trigger rebuild. Surfacing it as a recording failure would be
+    /// wrong — there is no recording to fail.
+    ///
+    /// Notifications from a replaced session are dropped: by the time the
+    /// queued block runs, `currentSessionIdentity` may already belong to a
+    /// newer recording, which must never be torn down by stale events.
+    private func handleRuntimeError(_ error: AudioRecorderError, fromSession identity: ObjectIdentifier) {
+        sessionQueue.async {
+            guard self.currentSessionIdentity == identity else {
+                os_log(.info, log: recordingLog, "dropping runtime error from a replaced capture session")
+                return
+            }
+            guard self._recording.withLock({ $0 }) else {
+                os_log(.info, log: recordingLog, "idle capture session hit a runtime error — invalidating retained session: %{public}@", error.localizedDescription)
+                self.teardownSessionLocked()
+                return
+            }
+            os_log(.error, log: recordingLog, "capture session runtime error during recording: %{public}@", error.localizedDescription)
+            self.reportRecordingFailure(error)
+        }
     }
 
     private func reportRecordingFailure(_ error: Error, completion: ((URL?) -> Void)? = nil) {
@@ -342,7 +557,7 @@ final class AudioRecorder: NSObject, ObservableObject, AVCaptureAudioDataOutputS
         timer.setEventHandler { [weak self] in
             guard let self else { return }
             guard self._recording.withLock({ $0 }) else { return }
-            guard !self.isSessionInterrupted else {
+            guard self.captureSessionState != .interrupted else {
                 os_log(.info, log: recordingLog, "watchdog suspended while capture session is interrupted")
                 return
             }
@@ -394,21 +609,32 @@ final class AudioRecorder: NSObject, ObservableObject, AVCaptureAudioDataOutputS
         return shouldKeepFile ? finalizedURL : nil
     }
 
-    private func handleSessionInterrupted(_ notification: Notification) {
+    private func handleSessionInterrupted(_ notification: Notification, fromSession identity: ObjectIdentifier) {
         _ = notification
         sessionQueue.async {
-            guard self._recording.withLock({ $0 }) else { return }
-            self.isSessionInterrupted = true
-            self.cancelWatchdog()
-            os_log(.info, log: recordingLog, "capture session interrupted — waiting for recovery")
+            guard self.currentSessionIdentity == identity else {
+                os_log(.info, log: recordingLog, "dropping interruption from a replaced capture session")
+                return
+            }
+            if self._recording.withLock({ $0 }) {
+                self.captureSessionState = .interrupted
+                self.cancelWatchdog()
+                os_log(.info, log: recordingLog, "capture session interrupted — waiting for recovery")
+            } else {
+                // An interruption while idle invalidates the retained session;
+                // never revive it. The next trigger rebuilds from scratch.
+                os_log(.info, log: recordingLog, "idle capture session interrupted — dropping retained session")
+                self.teardownSessionLocked()
+            }
         }
     }
 
-    private func handleSessionInterruptionEnded(_ notification: Notification) {
+    private func handleSessionInterruptionEnded(_ notification: Notification, fromSession identity: ObjectIdentifier) {
         _ = notification
         sessionQueue.async {
-            guard self._recording.withLock({ $0 }) else { return }
-            self.isSessionInterrupted = false
+            guard self.currentSessionIdentity == identity else { return }
+            guard self.captureSessionState == .interrupted else { return }
+            self.captureSessionState = .recording
             os_log(.info, log: recordingLog, "capture session interruption ended — restarting watchdog")
             self.startBufferWatchdog()
         }
@@ -501,6 +727,29 @@ final class AudioRecorder: NSObject, ObservableObject, AVCaptureAudioDataOutputS
         }
 
         if sourceFormat == targetFormat {
+            // The decoded buffer is shared with the realtime stream and the
+            // level meter, so it must never be mutated — filter a copy.
+            let frameCount = Int(inputBuffer.frameLength)
+            if let sourceInt16 = inputBuffer.int16ChannelData?[0],
+               let filteredCopy = AVAudioPCMBuffer(pcmFormat: targetFormat, frameCapacity: inputBuffer.frameCapacity) {
+                filteredCopy.frameLength = inputBuffer.frameLength
+                if let destinationInt16 = filteredCopy.int16ChannelData?[0] {
+                    FileAudioHighPass.applyToInt16(
+                        sourceInt16,
+                        destination: destinationInt16,
+                        frameCount: frameCount,
+                        filter: &fileHighPassFilter,
+                        floatScratch: &fileHighPassFloatScratch
+                    )
+                    try activeAudioFile.write(from: filteredCopy)
+                    recordedFrameCount += AVAudioFramePosition(frameCount)
+                    return
+                }
+            }
+            // Copy/filter path unavailable (unexpected); write unfiltered
+            // rather than dropping audio — and record that this recording is
+            // NOT pre-filtered, so enhancement applies the whole-file pass.
+            fileHighPassSucceededLock.withLock { $0 = false }
             try activeAudioFile.write(from: inputBuffer)
             recordedFrameCount += AVAudioFramePosition(inputBuffer.frameLength)
             return
@@ -512,6 +761,23 @@ final class AudioRecorder: NSObject, ObservableObject, AVCaptureAudioDataOutputS
             to: targetFormat
         )
         guard outputBuffer.frameLength > 0 else { return }
+        // outputBuffer is freshly allocated by the converter for this call, so
+        // it can be filtered in place. The shared decoded buffer is untouched:
+        // captureOutput passes it onward to the realtime emit and level meter
+        // after this returns.
+        if let int16Samples = outputBuffer.int16ChannelData?[0] {
+            FileAudioHighPass.applyToInt16(
+                int16Samples,
+                destination: int16Samples,
+                frameCount: Int(outputBuffer.frameLength),
+                filter: &fileHighPassFilter,
+                floatScratch: &fileHighPassFloatScratch
+            )
+        } else {
+            // Cannot filter this buffer; mark the recording unfiltered so the
+            // enhancement stage compensates with the whole-file pass.
+            fileHighPassSucceededLock.withLock { $0 = false }
+        }
         try activeAudioFile.write(from: outputBuffer)
         recordedFrameCount += AVAudioFramePosition(outputBuffer.frameLength)
     }
@@ -675,23 +941,46 @@ final class AudioRecorder: NSObject, ObservableObject, AVCaptureAudioDataOutputS
         cancelPrewarmCooldownLocked()
         let device = try preferredCaptureDevice(for: deviceUID, reason: "start recording")
 
-        // Reuse a pre-warmed, already-running session for the same device so
-        // recording starts without paying AVCaptureSession.startRunning() again.
-        if isPrewarmed,
-           let session = captureSession,
-           session.isRunning,
-           currentDeviceUID == device.uniqueID {
-            isPrewarmed = false
+        // Reuse a retained session for the same device so the trigger pays only
+        // `startRunning()` (measured ~40 ms) instead of a full rebuild
+        // (~105 ms configure + ~130 ms cold start). Two idle flavors reuse:
+        //
+        // - `.configuredStopped`: the default post-dictation retention. The
+        //   mic is not running while idle, so the system indicator stays dark.
+        // - `.runningPrewarm`: the opt-in pre-warm, still running. Recording
+        //   begins without even `startRunning()`.
+        switch captureSessionState {
+        case .runningPrewarm where currentDeviceUID == device.uniqueID:
+            guard let session = captureSession, session.isRunning else { break }
             resetFileWritingStateLocked()
             tempFileURL = outputURL
-            os_log(.info, log: recordingLog, "reusing pre-warmed capture session for %{public}@", device.localizedName)
+            captureSessionState = .recording
+            onSessionPrepared?(true)
+            os_log(.info, log: recordingLog, "reusing running pre-warmed session for %{public}@", device.localizedName)
             return
+        case .configuredStopped where currentDeviceUID == device.uniqueID:
+            guard let session = captureSession else { break }
+            resetFileWritingStateLocked()
+            tempFileURL = outputURL
+            session.startRunning()
+            if session.isRunning {
+                captureSessionState = .recording
+                onSessionPrepared?(true)
+                os_log(.info, log: recordingLog, "reused retained stopped session for %{public}@ — startRunning only", device.localizedName)
+                return
+            }
+            // startRunning() failed on a stale retained session (device
+            // vanished mid-idle, route change). Fall through to a full rebuild.
+            os_log(.info, log: recordingLog, "retained session failed to start — rebuilding")
+        default:
+            break
         }
 
         try configureSessionLocked(device: device)
-        isPrewarmed = false
         resetFileWritingStateLocked()
         tempFileURL = outputURL
+        captureSessionState = .recording
+        onSessionPrepared?(false)
     }
 
     /// Builds, configures, and starts a capture session for `device`. Shared by
@@ -746,7 +1035,6 @@ final class AudioRecorder: NSObject, ObservableObject, AVCaptureAudioDataOutputS
         currentInput = input
         audioDataOutput = dataOutput
         currentDeviceUID = device.uniqueID
-        isSessionInterrupted = false
         recordingConverterLock.withLock { $0 = nil }
         pcm16ConverterLock.withLock { $0 = nil }
         installSessionObservers(for: session)
@@ -768,18 +1056,28 @@ final class AudioRecorder: NSObject, ObservableObject, AVCaptureAudioDataOutputS
         activeAudioFormat = nil
         recordedFrameCount = 0
         loggedCaptureFormat = false
+        fileHighPassFilter.reset()
+        fileHighPassSucceededLock.withLock { $0 = true }
         fileWriteErrorLock.withLock { _ in
             fileWriteError = nil
         }
     }
 
+    /// Whether the finished recording was fully high-passed during capture.
+    /// Read after ``stopRecording`` completes (the sample queue is drained by
+    /// then); written only on the sample queue under a lock.
+    var lastRecordingHighPassApplied: Bool {
+        fileHighPassSucceededLock.withLock { $0 }
+    }
+
     /// Pre-warms an idle capture session so the next ``startRecording`` can skip
-    /// the `AVCaptureSession.startRunning()` cost (the dominant first-record
-    /// latency). While warm the session runs but every sample buffer is dropped
-    /// in ``captureOutput`` because `_recording` is false (nothing is written or
-    /// metered). To bound battery use and the time the system mic-in-use
-    /// indicator stays lit, a warm session auto-cools-down after
-    /// ``prewarmIdleTimeout`` if no recording starts. No-op while recording.
+    /// even `startRunning()`. While warm the session runs but every sample
+    /// buffer is dropped in ``captureOutput`` because `_recording` is false
+    /// (nothing is written or metered). This state keeps the system mic
+    /// indicator lit, so it is strictly opt-in and auto-cools-down after
+    /// ``prewarmIdleTimeout``. The default idle retention is
+    /// ``CaptureSessionState/configuredStopped``, which stays dark. No-op while
+    /// recording.
     func prewarm(deviceUID: String? = nil) {
         sessionQueue.async {
             guard !self._recording.withLock({ $0 }) else { return }
@@ -787,20 +1085,22 @@ final class AudioRecorder: NSObject, ObservableObject, AVCaptureAudioDataOutputS
                 let device = try self.preferredCaptureDevice(for: deviceUID, reason: "prewarm")
                 if let session = self.captureSession,
                    session.isRunning,
-                   self.currentDeviceUID == device.uniqueID {
+                   self.currentDeviceUID == device.uniqueID,
+                   self.captureSessionState == .runningPrewarm || self.captureSessionState == .recording {
                     // Already warm with the right device; just refresh the timer.
-                    self.isPrewarmed = true
-                    self.schedulePrewarmCooldownLocked()
+                    if self.captureSessionState != .recording {
+                        self.captureSessionState = .runningPrewarm
+                        self.schedulePrewarmCooldownLocked()
+                    }
                     return
                 }
                 try self.configureSessionLocked(device: device)
-                self.isPrewarmed = true
+                self.captureSessionState = .runningPrewarm
                 self.schedulePrewarmCooldownLocked()
                 os_log(.info, log: recordingLog, "capture session pre-warmed with %{public}@", device.localizedName)
             } catch {
                 os_log(.error, log: recordingLog, "prewarm failed: %{public}@", error.localizedDescription)
                 self.teardownSessionLocked()
-                self.isPrewarmed = false
             }
         }
     }
@@ -809,10 +1109,9 @@ final class AudioRecorder: NSObject, ObservableObject, AVCaptureAudioDataOutputS
     /// recording owns the session).
     func stopPrewarm() {
         sessionQueue.async {
-            guard self.isPrewarmed, !self._recording.withLock({ $0 }) else { return }
+            guard self.captureSessionState == .runningPrewarm, !self._recording.withLock({ $0 }) else { return }
             self.cancelPrewarmCooldownLocked()
             self.teardownSessionLocked()
-            self.isPrewarmed = false
             os_log(.info, log: recordingLog, "pre-warmed capture session torn down")
         }
     }
@@ -823,10 +1122,8 @@ final class AudioRecorder: NSObject, ObservableObject, AVCaptureAudioDataOutputS
         timer.schedule(deadline: .now() + Self.prewarmIdleTimeout)
         timer.setEventHandler { [weak self] in
             guard let self else { return }
-            guard self.isPrewarmed, !self._recording.withLock({ $0 }) else { return }
-            self.cancelPrewarmCooldownLocked()
+            guard self.captureSessionState == .runningPrewarm, !self._recording.withLock({ $0 }) else { return }
             self.teardownSessionLocked()
-            self.isPrewarmed = false
             os_log(.info, log: recordingLog, "pre-warm idle timeout — cooling down")
         }
         timer.resume()
@@ -881,8 +1178,7 @@ final class AudioRecorder: NSObject, ObservableObject, AVCaptureAudioDataOutputS
         os_log(.info, log: recordingLog, "stopRecording() called: %.3fms after start, %d buffers received", elapsed, count)
 
         sessionQueue.async {
-            self.cancelWatchdog()
-            self.teardownSessionLocked()
+            self.retireSessionToConfiguredStopLocked()
             let outputURL = self.finishAudioFileLocked(discard: false)
             self._recording.withLock { $0 = false }
             self.liveLevelNormalizerLock.withLock { $0.reset() }
@@ -896,8 +1192,9 @@ final class AudioRecorder: NSObject, ObservableObject, AVCaptureAudioDataOutputS
 
     func cancelRecording() {
         sessionQueue.async {
-            self.cancelWatchdog()
-            self.teardownSessionLocked()
+            // A clean cancel keeps the configured session for the next
+            // dictation, exactly like a normal stop.
+            self.retireSessionToConfiguredStopLocked()
             let discardURL = self.finishAudioFileLocked(discard: true)
             self._recording.withLock { $0 = false }
             self.liveLevelNormalizerLock.withLock { $0.reset() }
@@ -1013,31 +1310,6 @@ final class AudioRecorder: NSObject, ObservableObject, AVCaptureAudioDataOutputS
         return sessionQueue.sync(execute: body)
     }
 
-    /// Enhances a recorded PCM WAV for speech recognition and writes the result
-    /// to a new temporary WAV. Two stages are applied:
-    ///
-    /// 1. An 80 Hz first-order high-pass filter that removes DC offset and
-    ///    sub-speech rumble (HVAC, mic handling, desk thumps). Whisper's mel
-    ///    front-end is robust to absolute loudness but sensitive to SNR, so
-    ///    stripping low-frequency energy outside the speech band raises the
-    ///    effective SNR of quiet/soft speech and improves word recognition.
-    /// 2. Loudness normalization toward a consistent target RMS, with a peak
-    ///    ceiling and a capped makeup gain, so faint dictation reaches the model
-    ///    at a predictable level. It never attenuates.
-    ///
-    /// The operation is intentionally conservative and self-healing:
-    /// - Silent clips (RMS below ``silenceRMSFloor``) are skipped so we never
-    ///   amplify the noise floor.
-    /// - Makeup gain is capped (``maxMakeupGain``) and limited so the peak can
-    ///   never exceed ``peakCeiling``. If the high-passed signal already
-    ///   overshoots the ceiling, enhancement is abandoned (returns `nil`) so the
-    ///   caller uploads the original rather than a clipped version. A final
-    ///   hard clip to [-1, 1] only guards the float-to-Int16 write.
-    /// - Any failure returns `nil`.
-    ///
-    /// - Returns: A new temporary WAV URL the caller should upload (and delete
-    ///   afterward), or `nil` when enhancement was skipped or failed — in which
-    ///   case the caller must upload the original file unchanged.
     /// Applies `y[n] = alpha * (y[n-1] + x[n] - x[n-1])` in place.
     ///
     /// Expressed as a biquad for `vDSP_deq22` rather than a scalar loop. The
@@ -1104,7 +1376,147 @@ final class AudioRecorder: NSObject, ObservableObject, AVCaptureAudioDataOutputS
         }
     }
 
-    static func enhancedWAV(at sourceURL: URL) -> URL? {
+    /// Loudness targeting result for the normalization stage.
+    struct LoudnessTarget {
+        /// The RMS the gain stage should target: the speech-active RMS when
+        /// measurement was confident, otherwise the whole-file RMS (legacy
+        /// behavior).
+        let effectiveRMS: Float
+        let usedSpeechWeighting: Bool
+        let speechFrameFraction: Double
+        let snrMarginDB: Double
+    }
+
+    /// Speech-aware loudness targeting for the normalization stage.
+    ///
+    /// The legacy whole-file RMS treats pauses as signal: a whisperer who
+    /// dictates in short bursts measures far quieter than they speak, so the
+    /// gain stage under-boosts their speech — or, when it does reach for more
+    /// gain, spends the budget amplifying silence. This estimator instead:
+    ///
+    /// 1. Computes per-frame mean squares (25 ms frames).
+    /// 2. Estimates the noise floor conservatively from leading/trailing
+    ///    "edge" frames (a dictation usually starts and ends in room tone),
+    ///    falling back to a low percentile of all frames; the higher (more
+    ///    conservative) estimate wins.
+    /// 3. Counts speech frames above floor + margin and requires *meaningful*
+    ///    separation between speech energy and that floor.
+    /// 4. Falls back to the whole-file RMS unless every confidence gate passes,
+    ///    so uncertain audio is never amplified aggressively — continuous
+    ///    whisper with no discernible floor must not have its noise floor
+    ///    boosted to look like speech.
+    ///
+    /// Pure function of the frame energies — unit-testable without audio I/O.
+    static func loudnessTarget(
+        frameMeanSquares: [Float],
+        sampleRate: Double
+    ) -> LoudnessTarget {
+        let wholeFileFallback = { (frames: [Float]) -> LoudnessTarget in
+            let mean = frames.reduce(Float(0), +) / Float(max(frames.count, 1))
+            return LoudnessTarget(effectiveRMS: sqrt(mean), usedSpeechWeighting: false, speechFrameFraction: 0, snrMarginDB: 0)
+        }
+        guard frameMeanSquares.count >= 4 else {
+            return wholeFileFallback(frameMeanSquares)
+        }
+        let frameSeconds = 0.025
+        // ~0.5 s worth of frames on each side (leading/trailing room tone).
+        // NOTE: this is seconds converted to a frame COUNT — not a fraction
+        // of all frames. An earlier draft multiplied sample rate by frame
+        // duration here, producing windows so large they overlapped the
+        // speech and poisoned the floor estimate on short recordings.
+        let framesPerEdgeWindow = max(2, Int((0.5 / frameSeconds).rounded()))
+        let n = frameMeanSquares.count
+
+        func dB(_ linear: Float) -> Double {
+            10 * log10(Double(max(linear, .leastNormalMagnitude)))
+        }
+
+        // Noise floor candidates: edge-window median (leading+trailing) and a
+        // low overall percentile. Conservative = take the higher estimate.
+        let sorted = frameMeanSquares.sorted()
+        var floorCandidates: [Float] = []
+        let edgeCount = min(framesPerEdgeWindow * 2, n)
+        if edgeCount >= 4 {
+            var edgeFrames = Array(frameMeanSquares.prefix(framesPerEdgeWindow))
+            edgeFrames.append(contentsOf: frameMeanSquares.suffix(framesPerEdgeWindow))
+            edgeFrames.sort()
+            let median = edgeFrames[edgeFrames.count / 2]
+            floorCandidates.append(median)
+        }
+        floorCandidates.append(sorted[max(0, Int(Double(n) * 0.10))])
+        let noiseFloorLinear = floorCandidates.max() ?? sorted[0]
+        let floorDB = dB(noiseFloorLinear)
+
+        // Speech frames: meaningfully above the floor.
+        let marginDB = 8.0
+        let thresholdDB = floorDB + marginDB
+        var speechEnergies: [Float] = []
+        speechEnergies.reserveCapacity(n)
+        for energy in frameMeanSquares where dB(energy) > thresholdDB {
+            speechEnergies.append(energy)
+        }
+        let speechFraction = Double(speechEnergies.count) / Double(n)
+
+        // Confidence gates — any miss falls back to legacy behavior.
+        let minimumSpeechFrames = 4
+        guard speechEnergies.count >= minimumSpeechFrames, speechFraction >= 0.02 else {
+            return LoudnessTarget(effectiveRMS: sqrt(frameMeanSquares.reduce(0, +) / Float(n)), usedSpeechWeighting: false, speechFrameFraction: speechFraction, snrMarginDB: 0)
+        }
+
+        // Measured separation: robust high speech percentile vs floor.
+        speechEnergies.sort()
+        let speechHighDB = dB(speechEnergies[min(speechEnergies.count - 1, (speechEnergies.count * 9) / 10)])
+        let snrMarginDB = speechHighDB - floorDB
+        guard snrMarginDB >= 6.0 else {
+            return LoudnessTarget(effectiveRMS: sqrt(frameMeanSquares.reduce(0, +) / Float(n)), usedSpeechWeighting: false, speechFrameFraction: speechFraction, snrMarginDB: snrMarginDB)
+        }
+
+        let speechRMS = sqrt(speechEnergies.reduce(0, +) / Float(speechEnergies.count))
+        return LoudnessTarget(effectiveRMS: speechRMS, usedSpeechWeighting: true, speechFrameFraction: speechFraction, snrMarginDB: snrMarginDB)
+    }
+
+    /// Enhances a recorded PCM WAV for speech recognition and writes the result
+    /// to a new temporary upload file: lossless FLAC when `compress` is set,
+    /// otherwise WAV.
+    ///
+    /// - Parameter highPassAppliedDuringCapture: `true` when the recording was
+    ///   written through ``StreamingHighPassFilter`` during capture — the
+    ///   production path since the high-pass moved out of the stop path. The
+    ///   80 Hz filter is already in the file, so Stage 1 here would
+    ///   double-filter. `false` runs the whole-file Stage 1 pass; that mode is
+    ///   retained as the reference implementation for the streaming-vs-
+    ///   whole-file equivalence harness (and as a fallback if the incremental
+    ///   path ever needs disabling).
+    /// - Parameter compress: Write FLAC instead of WAV. FLAC is lossless — the
+    ///   provider decodes the same 16-bit samples — but measured at ~57% of the
+    ///   enhanced WAV's size on real dictations, so the upload on the
+    ///   release-to-paste path moves ~43% fewer bytes. Encoding costs ~0.7 ms
+    ///   per second of audio. When set, a recording too hot to boost is still written
+    ///   (at unity gain) so it gets the smaller upload too. Falls back to WAV
+    ///   if the FLAC encoder fails.
+    ///
+    /// Remaining stages: loudness normalization toward a consistent target RMS,
+    /// with a peak ceiling and a capped makeup gain, so faint dictation reaches
+    /// the model at a predictable level. It never attenuates.
+    ///
+    /// The operation is intentionally conservative and self-healing:
+    /// - Silent clips (RMS below ``silenceRMSFloor``) are skipped so we never
+    ///   amplify the noise floor.
+    /// - Makeup gain is capped (``maxMakeupGain``) and limited so the peak can
+    ///   never exceed ``peakCeiling``. If the signal already overshoots the
+    ///   ceiling, enhancement is abandoned (returns `nil`) so the caller
+    ///   uploads the original rather than a clipped version. A final hard clip
+    ///   to [-1, 1] only guards the float-to-Int16 write.
+    /// - Any failure returns `nil`.
+    ///
+    /// - Returns: A new temporary WAV URL the caller should upload (and delete
+    ///   afterward), or `nil` when enhancement was skipped or failed — in which
+    ///   case the caller must upload the original file unchanged.
+    static func enhancedAudioForUpload(
+        at sourceURL: URL,
+        highPassAppliedDuringCapture: Bool,
+        compress: Bool
+    ) -> URL? {
         let targetRMS: Float = 0.125      // ~ -18 dBFS, a comfortable speech level
         let peakCeiling: Float = 0.97     // ~ -0.26 dBFS, leaves headroom
         let maxMakeupGain: Float = 11.0   // ~ +21 dB cap so we don't blow up noise
@@ -1140,40 +1552,77 @@ final class AudioRecorder: NSObject, ObservableObject, AVCaptureAudioDataOutputS
 
             // --- Stage 1: first-order high-pass (in place, per channel) ---
             // y[n] = alpha * (y[n-1] + x[n] - x[n-1])
-            let sampleRate = Float(format.sampleRate)
-            let rc = 1 / (2 * Float.pi * highPassCutoffHz)
-            let dt = 1 / sampleRate
-            let alpha = rc / (rc + dt)
-            for channel in 0..<channelCount {
-                Self.applyHighPass(to: channels[channel], frames: frames, alpha: alpha)
+            //
+            // Skipped when the recording was already filtered incrementally
+            // during capture (see StreamingHighPassFilter).
+            if !highPassAppliedDuringCapture {
+                let sampleRate = Float(format.sampleRate)
+                let rc = 1 / (2 * Float.pi * highPassCutoffHz)
+                let dt = 1 / sampleRate
+                let alpha = rc / (rc + dt)
+                for channel in 0..<channelCount {
+                    Self.applyHighPass(to: channels[channel], frames: frames, alpha: alpha)
+                }
             }
 
             // --- Stage 2: measure post-filter loudness/peak, apply safe gain ---
-            var summedMeanSquare: Float = 0
             var peak: Float = 0
             for channel in 0..<channelCount {
-                var meanSquare: Float = 0
-                vDSP_measqv(channels[channel], 1, &meanSquare, vDSP_Length(frames))
-                summedMeanSquare += meanSquare
                 var channelPeak: Float = 0
                 vDSP_maxmgv(channels[channel], 1, &channelPeak, vDSP_Length(frames))
                 peak = max(peak, channelPeak)
             }
-            let rms = sqrt(summedMeanSquare / Float(channelCount))
-            guard rms > 0, peak > 0 else { return nil }
+            guard peak > 0 else { return nil }
+
+            // Speech-aware loudness targeting (see ``loudnessTarget(frameMeanSquares:sampleRate:)``):
+            // frame energies averaged across channels, then a conservative
+            // speech-active RMS — falling back to the whole-file RMS whenever
+            // speech can't be distinguished from the noise floor.
+            //
+            // frameLength is clamped to the buffer length so a sub-25 ms
+            // recording still yields one full-signal frame. Without the clamp,
+            // an empty frame array would make the fallback compute sqrt(0) and
+            // drive desiredGain to infinity — pinning the gain to the makeup
+            // cap instead of the measured level.
+            let frameLength = max(1, min(Int((format.sampleRate * 0.025).rounded()), frames))
+            let frameTotal = frames / frameLength
+            var frameMeanSquares: [Float] = []
+            frameMeanSquares.reserveCapacity(frameTotal)
+            for frame in 0..<frameTotal {
+                let start = frame * frameLength
+                var sum: Float = 0
+                for channel in 0..<channelCount {
+                    var meanSquare: Float = 0
+                    vDSP_measqv(channels[channel] + start, 1, &meanSquare, vDSP_Length(frameLength))
+                    sum += meanSquare
+                }
+                frameMeanSquares.append(sum / Float(channelCount))
+            }
+            let target = Self.loudnessTarget(frameMeanSquares: frameMeanSquares, sampleRate: format.sampleRate)
+            os_log(
+                .info,
+                log: recordingLog,
+                "loudness target: method=%{public}@ speech_fraction=%.2f snr_margin=%.1fdB rms=%.5f",
+                target.usedSpeechWeighting ? "speech-weighted" : "whole-file",
+                target.speechFrameFraction,
+                target.snrMarginDB,
+                target.effectiveRMS
+            )
 
             // Target the desired RMS, but never amplify beyond the cap and
             // never let the loudest sample exceed the ceiling. If the
             // high-passed signal already overshoots the ceiling, bail out so
             // the caller uploads the untouched original rather than a clipped
-            // version.
+            // version — unless we're compressing and the buffer *is* the
+            // untouched original (no Stage 1 ran here), in which case it is
+            // written at unity gain so the upload still shrinks.
             let peakLimitedGain = peakCeiling / peak
-            guard peakLimitedGain >= 1 else {
+            guard peakLimitedGain >= 1 || (compress && highPassAppliedDuringCapture) else {
                 return nil
             }
             // Never attenuate (floor at 1), and keep the peak under the ceiling.
-            let desiredGain = max(targetRMS / rms, 1)
-            let gain = min(desiredGain, maxMakeupGain, peakLimitedGain)
+            let desiredGain = max(targetRMS / target.effectiveRMS, 1)
+            let gain = min(desiredGain, maxMakeupGain, max(peakLimitedGain, 1))
 
             if gain != 1 {
                 for channel in 0..<channelCount {
@@ -1189,6 +1638,9 @@ final class AudioRecorder: NSObject, ObservableObject, AVCaptureAudioDataOutputS
                 vDSP_vclip(channels[channel], 1, &low, &high, channels[channel], 1, vDSP_Length(frames))
             }
 
+            if compress, let flacURL = writeFLAC(buffer, format: inputFile.fileFormat) {
+                return flacURL
+            }
             let outputURL = FileManager.default.temporaryDirectory
                 .appendingPathComponent(UUID().uuidString + ".wav")
             let outputFile = try AVAudioFile(forWriting: outputURL, settings: inputFile.fileFormat.settings)
@@ -1196,6 +1648,67 @@ final class AudioRecorder: NSObject, ObservableObject, AVCaptureAudioDataOutputS
             return outputURL
         } catch {
             os_log(.info, log: recordingLog, "audio enhancement skipped: %{public}@", error.localizedDescription)
+            return nil
+        }
+    }
+
+    /// Encodes `buffer` as a 16-bit FLAC temp file, or returns `nil` (cleaning
+    /// up any partial file) so the caller can fall back to WAV.
+    ///
+    /// Quantizes the buffer to the 16-bit grid first — the resolution the
+    /// Int16 WAV write keeps, so decoded samples match it to within 1 LSB
+    /// (rounding-mode differences only). Without
+    /// it the gain stage leaves off-grid floats, the encoder preserves them at
+    /// 24-bit precision, and the "compressed" file came out larger than the
+    /// WAV. Clips shorter than a second stay WAV: Apple's encoder drops a
+    /// stream shorter than one FLAC block (it wrote a header-only file), and
+    /// there is nothing worth saving at that size anyway. The written file is
+    /// re-opened and its length checked before it is trusted.
+    private static func writeFLAC(_ buffer: AVAudioPCMBuffer, format: AVAudioFormat) -> URL? {
+        guard Double(buffer.frameLength) >= format.sampleRate,
+              buffer.format.commonFormat == .pcmFormatFloat32,
+              let channels = buffer.floatChannelData else {
+            return nil
+        }
+        let frameCount = vDSP_Length(buffer.frameLength)
+        var length = Int32(buffer.frameLength)
+        for channel in 0..<Int(buffer.format.channelCount) {
+            var scale: Float = 32_768
+            var inverseScale: Float = 1 / 32_768
+            vDSP_vsmul(channels[channel], 1, &scale, channels[channel], 1, frameCount)
+            vvnintf(channels[channel], channels[channel], &length)
+            vDSP_vsmul(channels[channel], 1, &inverseScale, channels[channel], 1, frameCount)
+        }
+
+        let outputURL = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString + ".flac")
+        do {
+            // Scoped so the file is closed (and the FLAC stream finalized)
+            // before the URL is handed to the uploader.
+            do {
+                let outputFile = try AVAudioFile(
+                    forWriting: outputURL,
+                    settings: [
+                        AVFormatIDKey: kAudioFormatFLAC,
+                        AVSampleRateKey: format.sampleRate,
+                        AVNumberOfChannelsKey: format.channelCount,
+                        AVLinearPCMBitDepthKey: 16
+                    ],
+                    commonFormat: buffer.format.commonFormat,
+                    interleaved: buffer.format.isInterleaved
+                )
+                try outputFile.write(from: buffer)
+            }
+            let writtenFrames = try AVAudioFile(forReading: outputURL).length
+            guard writtenFrames == AVAudioFramePosition(buffer.frameLength) else {
+                throw NSError(domain: "FluentFLAC", code: 1, userInfo: [
+                    NSLocalizedDescriptionKey: "wrote \(writtenFrames) of \(buffer.frameLength) frames"
+                ])
+            }
+            return outputURL
+        } catch {
+            os_log(.info, log: recordingLog, "FLAC encode failed, falling back to WAV: %{public}@", error.localizedDescription)
+            try? FileManager.default.removeItem(at: outputURL)
             return nil
         }
     }

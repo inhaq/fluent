@@ -51,6 +51,42 @@ class TranscriptionService {
         }
     }
 
+    /// Whether the recording should be uploaded as lossless FLAC rather than
+    /// WAV. FLAC is ~57% of the WAV's size, which matters when the upload
+    /// crosses the internet. Self-hosted servers on loopback/LAN gain nothing
+    /// from it, and some (e.g. whisper.cpp's server without `--convert`) only
+    /// accept WAV, so those keep WAV. Force WAV everywhere with
+    /// `defaults write com.inhaq.fluent upload_audio_format wav`.
+    var prefersCompressedUpload: Bool {
+        if UserDefaults.standard.string(forKey: "upload_audio_format")?.lowercased() == "wav" {
+            return false
+        }
+        guard let host = baseURL.host?.lowercased() else { return false }
+        return !Self.isLocalNetworkHost(host)
+    }
+
+    /// True for loopback, link-local, private-range, and mDNS hosts.
+    static func isLocalNetworkHost(_ host: String) -> Bool {
+        let host = host.trimmingCharacters(in: CharacterSet(charactersIn: "[]"))
+        if host == "localhost" || host.hasSuffix(".localhost") || host.hasSuffix(".local") {
+            return true
+        }
+        if host.contains(":") {
+            // IPv6: loopback, unique-local (fc00::/7), link-local (fe80::/10).
+            return host == "::1" || host.hasPrefix("fc") || host.hasPrefix("fd") || host.hasPrefix("fe80:")
+        }
+        let octets = host.split(separator: ".").compactMap { Int($0) }
+        guard octets.count == 4 else { return false }
+        switch (octets[0], octets[1]) {
+        case (127, _), (10, _), (192, 168), (169, 254):
+            return true
+        case (172, 16...31):
+            return true
+        default:
+            return false
+        }
+    }
+
     // Validate API key by hitting a lightweight endpoint
     /// Validates an API key by issuing a lightweight authenticated request to
     /// the provider's `models` endpoint. Returns `true` only on HTTP 200.
@@ -125,55 +161,216 @@ class TranscriptionService {
     }
 
     /// Issues the multipart upload to the provider's `audio/transcriptions`
-    /// endpoint via `URLSession` and returns the validated transcript.
+    /// endpoint via `URLSession`, returning the validated transcript.
+    ///
+    /// Retries exactly once, and only for **pre-acceptance** failures — cases
+    /// where the request provably never reached the provider's processing
+    /// pipeline: connection-level `URLError`s (lost network, DNS, unreachable
+    /// host) and non-HTTP responses. The session rotates first when the
+    /// connection itself is suspect.
+    ///
+    /// Deliberately NOT retried: timeouts, HTTP 429, and HTTP 5xx. For those,
+    /// the provider may have received and processed the audio, so a blind
+    /// resend risks duplicate transcription work (and billing) with no
+    /// idempotency-key support on these endpoints to prevent it. Permanent
+    /// failures (401/403/404/413, malformed requests, parse errors) and
+    /// cancellation are also never retried.
+    ///
+    /// Every attempt constructs a fresh `URLRequest`, multipart boundary, and
+    /// body: a consumed `httpBodyStream` cannot be replayed, and a reused
+    /// boundary would be invalid across requests anyway.
+    ///
+    /// The overall budget stays identical to the pre-retry behavior: all
+    /// attempts share one deadline equal to ``transcribe(fileURL:)``'s existing
+    /// outer timeout race, so two attempts can never stretch a dictation to
+    /// 2× the configured timeout. The outer race remains the authoritative cap.
     private func transcribeAudioWithURLSession(fileURL: URL) async throws -> String {
         let url = baseURL
             .appendingPathComponent("audio")
             .appendingPathComponent("transcriptions")
-        var request = URLRequest(url: url)
-        request.httpMethod = "POST"
-        request.timeoutInterval = transcriptionTimeoutSeconds
-        request.setValue("Bearer \(apiKey)", forHTTPHeaderField: "Authorization")
-        let boundary = UUID().uuidString
-        request.setValue("multipart/form-data; boundary=\(boundary)", forHTTPHeaderField: "Content-Type")
+        let deadline = Date().addingTimeInterval(transcriptionTimeoutSeconds)
 
-        do {
-            let (data, response): (Data, URLResponse)
-            if Self.streamingUploadEnabled {
-                (data, response) = try await uploadStreamed(
-                    request: request,
-                    audioFileURL: fileURL,
-                    boundary: boundary
+        var attempt = 0
+        while true {
+            try Task.checkCancellation()
+
+            attempt += 1
+            let boundary = UUID().uuidString
+            var request = URLRequest(url: url)
+            request.httpMethod = "POST"
+            request.timeoutInterval = transcriptionTimeoutSeconds
+            request.setValue("Bearer \(apiKey)", forHTTPHeaderField: "Authorization")
+            request.setValue("multipart/form-data; boundary=\(boundary)", forHTTPHeaderField: "Content-Type")
+
+            do {
+                let (data, response): (Data, URLResponse)
+                if Self.streamingUploadEnabled {
+                    (data, response) = try await uploadStreamed(
+                        request: request,
+                        audioFileURL: fileURL,
+                        boundary: boundary
+                    )
+                } else {
+                    (data, response) = try await uploadViaTempFile(
+                        request: request,
+                        audioFileURL: fileURL,
+                        boundary: boundary
+                    )
+                }
+                return try validateTranscriptionResponse(data: data, response: response, fileURL: fileURL)
+            } catch {
+                let nsError = error as NSError
+                os_log(
+                    .error,
+                    log: transcriptionLog,
+                    "URLSession upload failed for %{public}@ (bytes=%{public}lld): domain=%{public}@ code=%ld desc=%{public}@",
+                    fileURL.lastPathComponent,
+                    fileSizeBytes(for: fileURL),
+                    nsError.domain,
+                    nsError.code,
+                    error.localizedDescription
                 )
-            } else {
-                (data, response) = try await uploadViaTempFile(
-                    request: request,
-                    audioFileURL: fileURL,
-                    boundary: boundary
+
+                // Never fight our own cancellation or the outer timeout race.
+                guard !LLMAPITransport.isCancellation(error), !Task.isCancelled else {
+                    throw error
+                }
+
+                let decision = Self.retryDecision(for: error)
+                guard attempt < Self.maxTranscriptionAttempts, decision.shouldRetry else {
+                    throw error
+                }
+
+                if decision.rotateSession {
+                    LLMAPITransport.rotateSessionAfterConnectionFailure(
+                        reason: Self.rotationReason(for: error)
+                    )
+                }
+
+                // Backoff: provider-requested Retry-After wins over the nominal
+                // jittered base delay, both clamped to the remaining overall
+                // deadline minus the smallest useful attempt window. No time
+                // left means the failure stands — matching today's behavior.
+                let nominalDelay = Self.jitteredBaseBackoffSeconds()
+                let backoff = max(nominalDelay, decision.retryAfterSeconds ?? 0)
+                let minimumUsefulAttemptWindow: TimeInterval = 2
+                let remainingBudget = deadline.timeIntervalSinceNow - minimumUsefulAttemptWindow
+                guard remainingBudget > 0 else {
+                    os_log(.info, log: transcriptionLog, "transcription attempt %ld failed (%{public}@); no deadline budget left for a retry", attempt, error.localizedDescription)
+                    throw error
+                }
+                let delay = min(backoff, remainingBudget)
+                os_log(
+                    .info,
+                    log: transcriptionLog,
+                    "transcription attempt %ld failed (%{public}@) — retrying in %.0fms",
+                    attempt,
+                    error.localizedDescription,
+                    delay * 1000
                 )
+                try await Task.sleep(nanoseconds: UInt64(delay * 1_000_000_000))
             }
-            return try validateTranscriptionResponse(data: data, response: response, fileURL: fileURL)
-        } catch {
-            let nsError = error as NSError
-            os_log(
-                .error,
-                log: transcriptionLog,
-                "URLSession upload failed for %{public}@ (bytes=%{public}lld): domain=%{public}@ code=%ld desc=%{public}@",
-                fileURL.lastPathComponent,
-                fileSizeBytes(for: fileURL),
-                nsError.domain,
-                nsError.code,
-                error.localizedDescription
-            )
-            throw error
         }
     }
 
-    /// Opt-in (`stream_multipart_upload` user default) streamed-body upload that
-    /// avoids the multipart temp file entirely. Off by default so the proven
-    /// file-upload path remains the standard.
+    /// Maximum number of transcription attempts per dictation: the original
+    /// request plus one retry.
+    private static let maxTranscriptionAttempts = 2
+
+    /// Nominal backoff between attempts, jittered ±40% so simultaneous
+    /// failures across clients don't re-synchronize on the same beat.
+    private static func jitteredBaseBackoffSeconds() -> TimeInterval {
+        let base = 0.15
+        let jitter = Double.random(in: 0.6...1.4)
+        return base * jitter
+    }
+
+    private struct TranscriptionRetryDecision {
+        let shouldRetry: Bool
+        let rotateSession: Bool
+        let retryAfterSeconds: TimeInterval?
+    }
+
+    /// Classifies an upload/transcription failure for the one-shot retry.
+    ///
+    /// Only **pre-acceptance** failures retry — cases where the request
+    /// provably never reached the provider's processing pipeline:
+    ///
+    /// | Failure                            | Retry | Rotate |
+    /// |------------------------------------|-------|--------|
+    /// | Connection lost / DNS / cannot-connect | Yes | Yes  |
+    /// | Non-HTTP response (no status at all)   | Yes | Yes  |
+    /// | Timeout                                | No* | —   |
+    /// | HTTP 429 / 5xx                         | No  | No   |
+    /// | 401/403/404/413, parse, malformed      | No  | No   |
+    /// | Cancellation                           | No  | No   |
+    ///
+    /// \* A timeout means the provider may already have accepted and processed
+    /// the audio; these endpoints have no idempotency key, so resending risks
+    /// duplicate work/billing. The dictation surfaces its error instead.
+    private static func retryDecision(for error: Error) -> TranscriptionRetryDecision {
+        if let transcriptionError = error as? TranscriptionError {
+            switch transcriptionError {
+            case .submissionFailed(_, let statusCode, _):
+                guard statusCode == nil else {
+                    // Any HTTP response (429/5xx included) proves the provider
+                    // received the request — resending could duplicate it.
+                    return TranscriptionRetryDecision(shouldRetry: false, rotateSession: false, retryAfterSeconds: nil)
+                }
+                // Non-HTTP response ("No response from server"): the transport
+                // returned something unusable — distrust the connection and
+                // retry on a fresh one.
+                return TranscriptionRetryDecision(shouldRetry: true, rotateSession: true, retryAfterSeconds: nil)
+            default:
+                return TranscriptionRetryDecision(shouldRetry: false, rotateSession: false, retryAfterSeconds: nil)
+            }
+        }
+
+        if let urlError = error as? URLError {
+            if urlError.code == .timedOut {
+                // Ambiguous acceptance: the request may be processing server-
+                // side. Never resend without idempotency support.
+                return TranscriptionRetryDecision(shouldRetry: false, rotateSession: false, retryAfterSeconds: nil)
+            }
+            if isConnectionLevelFailure(urlError) {
+                return TranscriptionRetryDecision(shouldRetry: true, rotateSession: true, retryAfterSeconds: nil)
+            }
+            return TranscriptionRetryDecision(shouldRetry: false, rotateSession: false, retryAfterSeconds: nil)
+        }
+
+        return TranscriptionRetryDecision(shouldRetry: false, rotateSession: false, retryAfterSeconds: nil)
+    }
+
+    /// Human-readable reason for a session rotation, used in logs.
+    private static func rotationReason(for error: Error) -> String {
+        if let urlError = error as? URLError {
+            return "connection-level failure: \(urlError.code.rawValue)"
+        }
+        if let transcriptionError = error as? TranscriptionError,
+           case .submissionFailed(_, let statusCode, _) = transcriptionError, statusCode == nil {
+            return "non-HTTP response from provider"
+        }
+        return "unclassified connection fault"
+    }
+
+    /// Mirrors ``LLMAPITransport/isConnectionLevelFailure(_:)`` for URLError
+    /// inputs already narrowed by the caller.
+    private static func isConnectionLevelFailure(_ urlError: URLError) -> Bool {
+        LLMAPITransport.isConnectionLevelFailure(urlError)
+    }
+
+    /// Streamed-body upload (`stream_multipart_upload` user default) that
+    /// avoids the multipart temp-file round-trip entirely.
+    ///
+    /// Off by default: the one-shot `httpBodyStream` has no
+    /// `needNewBodyStream` handling, so a URLSession-level redirect or request
+    /// replay cannot get a fresh stream. The default temp-file path is fully
+    /// replayable. The streaming producer itself is wire-verified (byte-
+    /// identical to the temp-file body) and safe to opt into:
+    /// `defaults write com.inhaq.fluent stream_multipart_upload -bool true`
     private static var streamingUploadEnabled: Bool {
-        UserDefaults.standard.bool(forKey: "stream_multipart_upload")
+        let stored = UserDefaults.standard.object(forKey: "stream_multipart_upload")
+        return stored as? Bool ?? false
     }
 
     /// Builds the multipart body on disk and uploads it from the file. This is
@@ -243,10 +440,11 @@ class TranscriptionService {
 
     /// Validates the HTTP response from a transcription upload, mapping
     /// non-200 statuses to user-readable errors, and parses the transcript on
-    /// success.
+    /// success. Non-200 errors carry the status code and any `Retry-After`
+    /// header so the retry policy can classify them precisely.
     private func validateTranscriptionResponse(data: Data, response: URLResponse, fileURL: URL) throws -> String {
         guard let httpResponse = response as? HTTPURLResponse else {
-            throw TranscriptionError.submissionFailed("No response from server")
+            throw TranscriptionError.submissionFailed(message: "No response from server", statusCode: nil, retryAfterSeconds: nil)
         }
 
         guard httpResponse.statusCode == 200 else {
@@ -260,13 +458,28 @@ class TranscriptionService {
                 fileSizeBytes(for: fileURL),
                 responseBody
             )
-            throw TranscriptionError.submissionFailed(Self.friendlyHTTPMessage(
-                status: httpResponse.statusCode,
-                host: baseURL.host
-            ))
+            let retryAfter = Self.retryAfterSeconds(from: httpResponse)
+            throw TranscriptionError.submissionFailed(
+                message: Self.friendlyHTTPMessage(
+                    status: httpResponse.statusCode,
+                    host: baseURL.host
+                ),
+                statusCode: httpResponse.statusCode,
+                retryAfterSeconds: retryAfter
+            )
         }
 
         return try parseTranscript(from: data)
+    }
+
+    /// Parses a `Retry-After` header in seconds form (the only form these
+    /// providers emit). Returns nil for absent or unparseable values.
+    private static func retryAfterSeconds(from response: HTTPURLResponse) -> TimeInterval? {
+        guard let rawValue = response.value(forHTTPHeaderField: "Retry-After")?
+            .trimmingCharacters(in: .whitespaces) else {
+            return nil
+        }
+        return TimeInterval(rawValue)
     }
     /// Returns the MIME content type for a given audio file name based on its
     /// extension, defaulting to `audio/mp4`.
@@ -279,6 +492,9 @@ class TranscriptionService {
         }
         if fileName.lowercased().hasSuffix(".m4a") {
             return "audio/mp4"
+        }
+        if fileName.lowercased().hasSuffix(".flac") {
+            return "audio/flac"
         }
         return "audio/mp4"
     }
@@ -585,7 +801,10 @@ class TranscriptionService {
 enum TranscriptionError: LocalizedError {
     case invalidBaseURL(String)
     case uploadFailed(String)
-    case submissionFailed(String)
+    /// The provider answered with a non-200 HTTP response (or nothing usable
+    /// at all). `statusCode` is nil when no HTTP response was available.
+    /// `retryAfterSeconds` carries a parsed `Retry-After` header for 429s.
+    case submissionFailed(message: String, statusCode: Int?, retryAfterSeconds: TimeInterval?)
     case transcriptionFailed(String)
     case transcriptionTimedOut(TimeInterval)
     case pollFailed(String)
@@ -595,9 +814,9 @@ enum TranscriptionError: LocalizedError {
         switch self {
         case .invalidBaseURL(let msg): return "Invalid provider URL: \(msg)"
         case .uploadFailed(let msg): return "Upload failed: \(msg)"
-        case .submissionFailed(let msg): return "Submission failed: \(msg)"
-        case .transcriptionTimedOut(let seconds): return "Transcription timed out after \(Int(seconds))s"
+        case .submissionFailed(let msg, _, _): return "Submission failed: \(msg)"
         case .transcriptionFailed(let msg): return "Transcription failed: \(msg)"
+        case .transcriptionTimedOut(let seconds): return "Transcription timed out after \(Int(seconds))s"
         case .pollFailed(let msg): return "Polling failed: \(msg)"
         case .audioPreparationFailed(let msg): return "Audio preparation failed: \(msg)"
         }

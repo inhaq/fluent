@@ -8,6 +8,34 @@ This project uses semantic versioning for public releases. Use `MAJOR.MINOR.PATC
 - `MINOR` changes add user-visible features and improvements.
 - `PATCH` changes fix bugs, polish existing behavior, or make small internal improvements.
 
+## [Unreleased]
+
+### Improved
+
+- **Faster recording start.** The capture session is now retained, fully configured but stopped, between dictations — verified to keep the macOS microphone indicator dark — so pressing the shortcut only pays `startRunning()` (measured ~40 ms) instead of rebuilding the session from scratch (~235 ms). Device changes and interruptions rebuild it automatically; idle runtime errors invalidate the retained session silently instead of surfacing a recording failure.
+- **Whisper-aware loudness targeting.** Gain normalization now targets the speech-active RMS (25 ms frame energies with a conservative noise-floor estimate from leading/trailing room tone) instead of the whole-file RMS. Quiet dictation with pauses lands on the −18 dBFS target without wasting the gain budget on silence; when speech can't be reliably distinguished from noise, the estimator falls back to the previous whole-file behavior.
+- **The 80 Hz high-pass now runs during capture** as an incremental stateful filter in the file-writing path, removing that pass from the stop-to-text critical path. Verified sample-equivalent to the previous whole-file pass (max 2 LSB difference from the single extra Int16 quantization step, no clipping introduced, no chunk-boundary artifacts).
+- **Upload connection reuse.** Transcription uploads share one persistent ephemeral URLSession instead of paying a fresh TCP+TLS handshake per dictation (~100–300 ms). The session rotates only after connection-level failures; HTTP status errors never poison it.
+- Streamed multipart upload (no temp-file body copy) is available behind `stream_multipart_upload` and stays off by default: the one-shot body stream can't be replayed across redirects. Its producer was rewritten with byte-counted file progression — fixing a truncation bug where `FileHandle.read(upToCount:)` throwing at end-of-file cut the body short of its advertised `Content-Length` (providers rejected these requests with HTTP 400) — and is wire-verified byte-identical to the temp-file body. The default remains the fully replayable temp-file path.
+- **Provider connections are prewarmed while you speak.** Uploads, post-processing, context, and model listing now share one persistent session, so the post-processing call reuses the upload's connection instead of opening its own. Pressing the shortcut also fires a low-priority `GET /models` to the transcription and LLM hosts (throttled per host), so the requests after release start on a warm connection. Measured against Groq: 525 ms cold vs 366 ms warm per request, about 160 ms saved per handshake, previously paid up to twice per dictation.
+- **Smaller audio uploads.** Recordings sent to remote providers are encoded as lossless 16-bit FLAC during the existing enhancement pass. Measured on real dictations: 57% of the WAV size (43% fewer bytes on the upload path) at ~0.7 ms of encoding per second of audio. Loopback/LAN servers keep WAV, as do clips under one second; `defaults write com.inhaq.fluent upload_audio_format wav` forces WAV everywhere.
+- **Clean dictations skip the cleanup request.** Short English transcripts that Whisper already returned punctuated, with no filler, self-corrections, dictated punctuation, greetings, likely names, stutters, or vocabulary near-misses, are pasted directly instead of waiting on a post-processing round trip. Never applies with a custom prompt, output language, screenshot context, selected text, or Edit Mode. Toggle it next to Post-Processing Reasoning in Settings (on by default).
+- **Paste release detection is event-driven.** The paste fires the moment the event tap observes the shortcut keys come up instead of waiting for the next 25 ms poll tick, with the same bounded polling fallback for safety.
+
+### Added
+
+- One-shot automatic retry for transcription requests, restricted to pre-acceptance failures (connection lost before any response, non-HTTP response) — cases where the provider provably never processed the audio. Timeouts and HTTP 429/5xx are deliberately not retried: these endpoints have no idempotency key, so a blind resend could duplicate transcription work. Permanent failures are never retried.
+- Expanded pipeline signposts: session reused vs rebuilt, enhancement start/end, upload start/response, and post-processing start/end, alongside the existing trigger → recorder-ready → stop → audio-finalized → transcript-received → paste marks.
+- Model dropdowns are now populated live from the provider's OpenAI-compatible `/models` endpoint, so newly released models show up without an app update. The list refreshes when the API URL or key changes (and on demand via **Refresh Models**), is cached per provider for offline use, hides inactive and non-chat models (speech, guard, embedding), and falls back to the built-in list until the first successful fetch.
+
+### Fixed
+
+- Post-Processing Reasoning set to **Off** sent `reasoning_effort: "none"` to gpt-oss models, which only accept low/medium/high. Groq rejected every cleanup request with HTTP 400 and each dictation fell back to the raw transcript after a wasted round trip. Off now maps to Low for gpt-oss.
+- Capture-session notifications are scoped to the session instance they belong to; a queued error or interruption from a replaced session can no longer tear down or fail a newer recording.
+- Restarting shortcut monitoring can no longer be misread as a physical key release (which could trigger a spurious paste while the shortcut was still held).
+- Concurrent paste/Enter release-waits now queue instead of overwriting each other.
+- If the capture-time high-pass ever has to bypass a buffer, the enhancement stage compensates with the whole-file filter pass instead of uploading unfiltered audio.
+
 ## [1.2.0] - 2026-06-26
 
 The project is now **Fluent**, a fork of Free Flow reworked for speed, transcription accuracy, and token efficiency. This release rebrands the app and folds in the improvements made since the fork.

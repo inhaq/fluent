@@ -126,12 +126,22 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         let hostingView = NSHostingView(rootView: settingsView)
 
         let window = NSWindow(
-            contentRect: NSRect(x: 0, y: 0, width: 780, height: 540),
-            styleMask: [.titled, .closable, .resizable, .miniaturizable],
+            contentRect: NSRect(x: 0, y: 0, width: 860, height: 600),
+            styleMask: [.titled, .closable, .resizable, .miniaturizable, .fullSizeContentView],
             backing: .buffered,
             defer: false
         )
         window.title = AppName.displayName
+        // Transparent titlebar over a material-backed root view gives the
+        // whole window one continuous glass sheet — the current macOS look.
+        // The window itself must be non-opaque or the materials have nothing
+        // behind them to blur.
+        window.titlebarAppearsTransparent = true
+        window.titleVisibility = .hidden
+        window.isMovableByWindowBackground = true
+        window.isOpaque = false
+        window.backgroundColor = .clear
+        window.minSize = NSSize(width: 780, height: 520)
         window.contentView = hostingView
         window.isReleasedWhenClosed = false
         window.center()
@@ -170,6 +180,8 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         window.title = AppName.displayName
         window.titlebarAppearsTransparent = true
         window.isMovableByWindowBackground = true
+        window.isOpaque = false
+        window.backgroundColor = .clear
         window.contentView = NSHostingView(rootView: setupView)
         window.minSize = NSSize(width: 520, height: 680)
         window.center()

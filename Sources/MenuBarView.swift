@@ -58,12 +58,56 @@ private struct PanelRow<Label: View>: View {
                 .padding(.vertical, 7)
                 .contentShape(Rectangle())
                 .background(
-                    RoundedRectangle(cornerRadius: 7, style: .continuous)
-                        .fill(hovering ? Color.primary.opacity(0.09) : Color.clear)
+                    RoundedRectangle(cornerRadius: 8, style: .continuous)
+                        .fill(hovering ? Color.primary.opacity(0.07) : Color.clear)
                 )
+                .scaleEffect(hovering ? 1.0 : 1.0)
         }
         .buttonStyle(.plain)
         .onHover { hovering = $0 }
+    }
+}
+
+/// Soft tinted banner for permission warnings — colored text on a quiet tint,
+/// with a hairline edge. Solid fills read as errors; these are invitations.
+private struct WarningBanner: View {
+    let title: String
+    let systemImage: String
+    let color: Color
+    let action: () -> Void
+
+    @State private var hovering = false
+
+    var body: some View {
+        Button(action: action) {
+            HStack(spacing: 10) {
+                Image(systemName: systemImage)
+                    .font(.system(size: 13, weight: .semibold))
+                    .foregroundStyle(color)
+                Text(title)
+                    .font(.caption.weight(.semibold))
+                    .foregroundStyle(color)
+                    .multilineTextAlignment(.leading)
+                Spacer(minLength: 0)
+                Image(systemName: "chevron.right")
+                    .font(.system(size: 9, weight: .bold))
+                    .foregroundStyle(color.opacity(0.6))
+            }
+            .padding(.horizontal, 11)
+            .padding(.vertical, 9)
+            .background(
+                RoundedRectangle(cornerRadius: FluentTheme.Radius.control, style: .continuous)
+                    .fill(color.opacity(hovering ? 0.16 : 0.10))
+            )
+            .overlay(
+                RoundedRectangle(cornerRadius: FluentTheme.Radius.control, style: .continuous)
+                    .strokeBorder(color.opacity(0.28), lineWidth: 1)
+            )
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .onHover { hovering = $0 }
+        .animation(.easeOut(duration: 0.12), value: hovering)
     }
 }
 
@@ -75,7 +119,7 @@ struct MenuBarView: View {
     /// panel opens at full height and shrinks to fit, never collapsing to 0.
     @State private var contentHeight: CGFloat = MenuBarView.maxPanelHeight
 
-    private static let panelWidth: CGFloat = 300
+    private static let panelWidth: CGFloat = 320
     private static let maxPanelHeight: CGFloat = 620
 
     private var appVersion: String {
@@ -137,50 +181,116 @@ struct MenuBarView: View {
     }
 
     private func rowLabel(_ title: String, systemImage: String, tint: Color = .primary) -> some View {
-        HStack(spacing: 9) {
+        HStack(spacing: 10) {
             Image(systemName: systemImage)
-                .font(.system(size: 13))
-                .frame(width: 18)
-                .foregroundStyle(tint)
+                .font(.system(size: 12, weight: .medium))
+                .foregroundStyle(tint == .primary ? Color.secondary : tint)
+                .frame(width: 16)
             Text(title)
+                .font(.body)
                 .foregroundStyle(.primary)
             Spacer(minLength: 0)
         }
+        .padding(.horizontal, 4)
+    }
+
+    /// Tiny uppercase divider label between panel groups.
+    private func sectionLabel(_ title: String) -> some View {
+        Text(title.uppercased())
+            .font(.caption2.weight(.semibold))
+            .tracking(0.07)
+            .foregroundStyle(Color.secondary.opacity(0.75))
+            .padding(.horizontal, 14)
+            .padding(.top, 6)
+            .padding(.bottom, 2)
     }
 
     private var statusLabel: some View {
         Group {
             if appState.isRecording {
-                Label("Recording…", systemImage: "record.circle")
-                    .foregroundStyle(.red)
+                statusPill(
+                    text: "Recording",
+                    color: .red,
+                    pulsing: true
+                )
             } else if appState.isTranscribing {
-                Label(appState.debugStatusMessage, systemImage: "ellipsis.circle")
-                    .foregroundStyle(.secondary)
+                HStack(spacing: 7) {
+                    ProgressView()
+                        .controlSize(.mini)
+                    Text(appState.debugStatusMessage.isEmpty ? "Processing" : appState.debugStatusMessage)
+                        .lineLimit(1)
+                }
+                .font(.caption.weight(.medium))
+                .foregroundStyle(.secondary)
+                .padding(.horizontal, 10)
+                .padding(.vertical, 5)
+                .frame(maxWidth: .infinity, alignment: .leading)
             } else {
-                Text(appState.shortcutStatusText)
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
+                HStack(spacing: 7) {
+                    Circle()
+                        .fill(Color.green.opacity(0.9))
+                        .frame(width: 6, height: 6)
+                    Text(appState.shortcutStatusText)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .lineLimit(1)
+                }
+                .padding(.horizontal, 10)
+                .frame(maxWidth: .infinity, alignment: .leading)
             }
         }
+        .padding(.vertical, 3)
+    }
+
+    @State private var pulse = false
+
+    private func statusPill(text: String, color: Color, pulsing: Bool) -> some View {
+        HStack(spacing: 7) {
+            Circle()
+                .fill(color)
+                .frame(width: 7, height: 7)
+                .opacity(pulsing ? (pulse ? 1.0 : 0.35) : 1.0)
+            Text(text)
+                .font(.caption.weight(.semibold))
+                .foregroundStyle(color)
+        }
         .padding(.horizontal, 10)
-        .frame(maxWidth: .infinity, alignment: .leading)
+        .padding(.vertical, 5)
+        .background(Capsule(style: .continuous).fill(color.opacity(0.12)))
+        .onAppear {
+            guard pulsing else { return }
+            withAnimation(.easeInOut(duration: 0.9).repeatForever(autoreverses: true)) {
+                pulse = true
+            }
+        }
     }
 
     var body: some View {
         ScrollView {
             VStack(alignment: .leading, spacing: 3) {
-                // Header
-                HStack {
+                // Header — app identity
+                HStack(spacing: 10) {
+                    if let appIcon = NSApp.applicationIconImage {
+                        Image(nsImage: appIcon)
+                            .resizable()
+                            .interpolation(.high)
+                            .frame(width: 26, height: 26)
+                            .clipShape(RoundedRectangle(cornerRadius: 6.5, style: .continuous))
+                            .shadow(color: .black.opacity(0.2), radius: 2, y: 1)
+                    }
                     Text(AppName.displayName)
                         .font(.headline)
                     Spacer()
                     Text("v\(appVersion)")
-                        .font(.caption)
+                        .font(.caption2.weight(.medium))
                         .foregroundStyle(.secondary)
+                        .padding(.horizontal, 7)
+                        .padding(.vertical, 2.5)
+                        .background(Capsule(style: .continuous).fill(Color.primary.opacity(0.06)))
                 }
                 .padding(.horizontal, 10)
                 .padding(.top, 4)
-                .padding(.bottom, 2)
+                .padding(.bottom, 8)
 
                 // Permission warnings
                 if !appState.hasScreenRecordingPermission {
@@ -223,7 +333,6 @@ struct MenuBarView: View {
                 .disabled(appState.isTranscribing)
                 .padding(.horizontal, 10)
                 .padding(.vertical, 4)
-
                 if let hotkeyError = appState.hotkeyMonitoringErrorMessage {
                     Text(hotkeyError)
                         .foregroundStyle(.red)
@@ -242,7 +351,8 @@ struct MenuBarView: View {
 
                 // Paste again + last transcript
                 if !appState.lastTranscript.isEmpty && !appState.isRecording && !appState.isTranscribing {
-                    Divider().padding(.vertical, 2)
+                    Divider().padding(.vertical, 4)
+                    sectionLabel("Last Transcript")
 
                     PanelRow {
                         appState.copyLastTranscriptToPasteboard()
@@ -264,10 +374,18 @@ struct MenuBarView: View {
                         .foregroundStyle(.secondary)
                         .lineLimit(3)
                         .padding(.horizontal, 12)
+                        .padding(.vertical, 8)
                         .frame(maxWidth: .infinity, alignment: .leading)
+                        .background(
+                            RoundedRectangle(cornerRadius: 8, style: .continuous)
+                                .fill(Color.primary.opacity(0.045))
+                        )
+                        .padding(.horizontal, 10)
+                        .padding(.top, 2)
                 }
 
-                Divider().padding(.vertical, 2)
+                Divider().padding(.vertical, 4)
+                sectionLabel("Library")
 
                 // History submenu
                 Menu {
@@ -302,7 +420,8 @@ struct MenuBarView: View {
                     rowLabel("Paste Custom Word to Vocabulary", systemImage: "text.badge.plus")
                 }
 
-                Divider().padding(.vertical, 2)
+                Divider().padding(.vertical, 4)
+                sectionLabel("Shortcuts")
 
                 // Shortcut submenus
                 holdShortcutMenu
@@ -310,7 +429,8 @@ struct MenuBarView: View {
                 copyAgainShortcutMenu
                 microphoneMenu
 
-                Divider().padding(.vertical, 2)
+                Divider().padding(.vertical, 4)
+                sectionLabel("App")
 
                 PanelRow {
                     NotificationCenter.default.post(name: .showSetup, object: nil)
@@ -350,7 +470,7 @@ struct MenuBarView: View {
                     rowLabel("Quit \(AppName.displayName)", systemImage: "power", tint: .secondary)
                 }
             }
-            .padding(8)
+            .padding(10)
             .background(
                 GeometryReader { proxy in
                     Color.clear
@@ -372,19 +492,9 @@ struct MenuBarView: View {
         color: Color,
         action: @escaping () -> Void
     ) -> some View {
-        Button(action: action) {
-            Label(title, systemImage: systemImage)
-                .font(.caption.weight(.semibold))
-                .foregroundStyle(.white)
-                .frame(maxWidth: .infinity, alignment: .leading)
-                .padding(.horizontal, 10)
-                .padding(.vertical, 8)
-                .background(
-                    RoundedRectangle(cornerRadius: 8, style: .continuous).fill(color)
-                )
-        }
-        .buttonStyle(.plain)
-        .padding(.horizontal, 6)
+        WarningBanner(title: title, systemImage: systemImage, color: color, action: action)
+            .padding(.horizontal, 6)
+            .padding(.bottom, 4)
     }
 
     @ViewBuilder
