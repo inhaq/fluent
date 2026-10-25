@@ -408,7 +408,7 @@ Model: \(model)
             payload["max_completion_tokens"] = postProcessingMaxCompletionTokens
         }
         if let override = reasoningEffortOverride {
-            payload["reasoning_effort"] = override
+            payload["reasoning_effort"] = Self.supportedReasoningEffort(override, for: model)
         } else if let effort = config.reasoningEffort {
             payload["reasoning_effort"] = effort
         } else if model == defaultModel {
@@ -543,7 +543,7 @@ Model: \(model)
             payload["max_completion_tokens"] = postProcessingMaxCompletionTokens
         }
         if let override = reasoningEffortOverride {
-            payload["reasoning_effort"] = override
+            payload["reasoning_effort"] = Self.supportedReasoningEffort(override, for: model)
         } else if let effort = config.reasoningEffort {
             payload["reasoning_effort"] = effort
         } else if model == defaultModel {
@@ -587,6 +587,186 @@ Model: \(model)
             transcript: sanitizedTranscript,
             prompt: promptForDisplay
         )
+    }
+
+    /// gpt-oss accepts only low/medium/high, so "none" (the Settings "Off"
+    /// option) made Groq reject every cleanup request with HTTP 400 and every
+    /// dictation silently fall back to the raw transcript after a wasted round
+    /// trip. Clamp it to the lowest effort the model accepts instead.
+    static func supportedReasoningEffort(_ requested: String, for model: String) -> String {
+        if requested == "none" && model.lowercased().contains("gpt-oss") {
+            return "low"
+        }
+        return requested
+    }
+
+    // MARK: Clean-transcript fast path
+    //
+    // Whisper already returns punctuated, capitalized text, so a short, fluent
+    // utterance often comes back from cleanup unchanged — after a full LLM
+    // round trip (~300–700 ms) on the release-to-paste path. The gate below
+    // lets such transcripts skip cleanup. It is deliberately conservative: any
+    // signal that the default prompt's rules would change something (filler,
+    // self-correction, dictated punctuation, list/email formatting, a
+    // stutter, a vocabulary near-miss, non-English text) sends the transcript
+    // to the model as before.
+
+    private static let cleanTranscriptMaxWords = 20
+
+    private static let cleanupCueWords: Set<String> = [
+        // Filler and hesitation
+        "um", "umm", "uh", "uhh", "uhm", "er", "erm", "ah", "hmm", "mm", "mhm", "like", "basically",
+        // Self-correction markers
+        "actually", "sorry", "wait", "scratch", "nevermind",
+        // Dictated punctuation and formatting
+        "comma", "period", "colon", "semicolon", "dash", "hyphen", "quote", "unquote", "paren",
+        "parenthesis", "bracket", "bullet", "bullets", "numbered", "newline", "paragraph",
+        "exclamation", "ellipsis", "slash", "asterisk", "hashtag", "emoji", "underscore", "dot", "list",
+        // Email greetings and closings (formatted into their own lines)
+        "hi", "hey", "hello", "dear", "thanks", "thank", "regards", "cheers", "sincerely"
+    ]
+
+    private static let cleanupCuePhrases = [
+        "you know", "i mean", "no wait", "new line", "question mark", "full stop", "kind of", "sort of"
+    ]
+
+    /// Function words that make an all-ASCII transcript very likely English,
+    /// the only language the cue lists above cover.
+    private static let englishMarkerWords: Set<String> = [
+        "the", "a", "an", "i", "to", "and", "is", "it", "you", "we", "that", "of", "for", "in",
+        "on", "this", "be", "can", "will", "my", "me", "are", "do", "with", "have", "what", "so"
+    ]
+
+    /// Returns `true` when `transcript` can be pasted as-is without changing
+    /// what the default cleanup prompt would produce in all likelihood.
+    ///
+    /// Never skips when the user customized the prompt or output language,
+    /// when the session captured a screenshot or selected text, or when the
+    /// transcript contains a mid-sentence capitalized word — a likely name,
+    /// which cleanup may respell from the app context.
+    static func transcriptIsAlreadyClean(
+        _ transcript: String,
+        context: AppContext,
+        customVocabulary: String,
+        customSystemPrompt: String,
+        outputLanguage: String
+    ) -> Bool {
+        guard customSystemPrompt.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+              outputLanguage.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+              context.screenshotDataURL == nil,
+              (context.selectedText ?? "").isEmpty else {
+            return false
+        }
+
+        let text = transcript.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard let first = text.unicodeScalars.first, let last = text.last,
+              CharacterSet.uppercaseLetters.contains(first) || CharacterSet.decimalDigits.contains(first),
+              ".!?".contains(last),
+              !text.contains("\n"),
+              text.unicodeScalars.allSatisfy({ $0.isASCII }) else {
+            return false
+        }
+
+        let words = text
+            .split(whereSeparator: { $0.isWhitespace })
+            .map { String($0) }
+        guard !words.isEmpty, words.count <= cleanTranscriptMaxWords else { return false }
+
+        // Whisper capitalizes the pronoun; a bare "i" means it didn't format.
+        if words.contains(where: { $0.trimmingCharacters(in: .punctuationCharacters) == "i" }) {
+            return false
+        }
+
+        // Capitalized words that don't start a sentence are likely names.
+        // All-caps acronyms ("API"), the pronoun ("I", "I'm"), and exact
+        // vocabulary spellings are fine.
+        let vocabularySpellings = Set(vocabularyWords(from: customVocabulary))
+        for (index, word) in words.enumerated() where index > 0 {
+            let startsSentence = words[index - 1].last.map { ".!?".contains($0) } ?? false
+            let letters = word.trimmingCharacters(in: .punctuationCharacters)
+            guard !startsSentence, let initial = letters.unicodeScalars.first,
+                  CharacterSet.uppercaseLetters.contains(initial) else { continue }
+            let isAcronym = letters.count >= 2 && letters == letters.uppercased()
+            let isPronoun = letters == "I" || letters.hasPrefix("I'")
+            if !isAcronym && !isPronoun && !vocabularySpellings.contains(letters) { return false }
+        }
+
+        let normalizedWords = words.map {
+            $0.lowercased().trimmingCharacters(in: .punctuationCharacters.union(.symbols))
+        }
+        guard normalizedWords.contains(where: { englishMarkerWords.contains($0) }) else { return false }
+        if normalizedWords.contains(where: { cleanupCueWords.contains($0) }) { return false }
+
+        let normalizedText = " " + normalizedWords.joined(separator: " ") + " "
+        if cleanupCuePhrases.contains(where: { normalizedText.contains(" \($0) ") }) { return false }
+
+        // Stutters and duplicate starts ("the the", "we should we should").
+        for (previous, current) in zip(normalizedWords, normalizedWords.dropFirst())
+            where !current.isEmpty && previous == current {
+            return false
+        }
+        if normalizedWords.count >= 4 {
+            for index in 0...(normalizedWords.count - 4)
+                where normalizedWords[index] == normalizedWords[index + 2]
+                    && normalizedWords[index + 1] == normalizedWords[index + 3] {
+                return false
+            }
+        }
+
+        return !containsVocabularyNearMiss(words: words, customVocabulary: customVocabulary)
+    }
+
+    /// True when a transcript word is a likely misspelling or mis-casing of a
+    /// custom vocabulary term — exactly what cleanup exists to fix.
+    private static func containsVocabularyNearMiss(words: [String], customVocabulary: String) -> Bool {
+        let vocabularyWords = vocabularyWords(from: customVocabulary)
+        guard !vocabularyWords.isEmpty else { return false }
+
+        for rawWord in words {
+            let word = rawWord.trimmingCharacters(in: .punctuationCharacters)
+            guard word.count >= 3 else { continue }
+            for term in vocabularyWords {
+                if word == term { continue }
+                if word.caseInsensitiveCompare(term) == .orderedSame { return true }
+                let lowerWord = word.lowercased()
+                let lowerTerm = term.lowercased()
+                guard abs(lowerWord.count - lowerTerm.count) <= 2 else { continue }
+                let allowedDistance = max(1, lowerTerm.count / 4)
+                if editDistance(lowerWord, lowerTerm, limit: allowedDistance) <= allowedDistance {
+                    return true
+                }
+            }
+        }
+        return false
+    }
+
+    /// The individual words (3+ characters) of the user's vocabulary terms.
+    private static func vocabularyWords(from customVocabulary: String) -> [String] {
+        customVocabulary
+            .split(whereSeparator: { $0 == "\n" || $0 == "," || $0 == ";" || $0.isWhitespace })
+            .map { $0.trimmingCharacters(in: .punctuationCharacters) }
+            .filter { $0.count >= 3 }
+    }
+
+    /// Levenshtein distance, abandoning early once every path exceeds `limit`.
+    private static func editDistance(_ lhs: String, _ rhs: String, limit: Int) -> Int {
+        let a = Array(lhs), b = Array(rhs)
+        guard !a.isEmpty else { return b.count }
+        guard !b.isEmpty else { return a.count }
+        var previous = Array(0...b.count)
+        for i in 1...a.count {
+            var current = [i] + Array(repeating: 0, count: b.count)
+            for j in 1...b.count {
+                current[j] = min(
+                    previous[j] + 1,
+                    current[j - 1] + 1,
+                    previous[j - 1] + (a[i - 1] == b[j - 1] ? 0 : 1)
+                )
+            }
+            if (current.min() ?? 0) > limit { return limit + 1 }
+            previous = current
+        }
+        return previous[b.count]
     }
 
     static func applyOutputLanguage(_ prompt: String, language: String) -> String {

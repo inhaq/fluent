@@ -59,9 +59,33 @@ private func makeNotchContent<V: View>(
     cornerRadius: CGFloat,
     rootView: V
 ) -> NSView {
+    // Near-black vertical gradient with a top light lip: reads as polished
+    // glass rather than flat black, while staying dark enough that the camera
+    // cutout region still disappears into the bezel.
     let shaped = rootView
         .frame(width: width, height: height)
-        .background(Color.black)
+        .background(
+            LinearGradient(
+                colors: [
+                    Color(red: 0.075, green: 0.075, blue: 0.08),
+                    Color.black,
+                ],
+                startPoint: .top,
+                endPoint: .bottom
+            )
+        )
+        .overlay(
+            UnevenRoundedRectangle(bottomLeadingRadius: cornerRadius, bottomTrailingRadius: cornerRadius)
+                .strokeBorder(
+                    LinearGradient(
+                        colors: [Color.white.opacity(0.10), Color.white.opacity(0.0)],
+                        startPoint: .top,
+                        endPoint: .bottom
+                    ),
+                    lineWidth: 1
+                )
+                .allowsHitTesting(false)
+        )
         .clipShape(UnevenRoundedRectangle(bottomLeadingRadius: cornerRadius, bottomTrailingRadius: cornerRadius))
 
     let hosting = NSHostingView(rootView: shaped)
@@ -592,19 +616,11 @@ struct WingedRecordingView: View {
                 Spacer(minLength: 0)
                 Group {
                     if state.phase == .feedback {
-                        Image(systemName: "xmark")
-                            .font(.system(size: 7, weight: .bold))
-                            .foregroundStyle(.white)
-                            .frame(width: 14, height: 14)
-                            .background(Circle().fill(Color.red.opacity(0.92)))
+                        OverlayControlCircle(systemName: "xmark", tint: .red)
                             .transition(.opacity)
                     } else if showsStopButton {
                         Button(action: onStopButtonPressed) {
-                            Image(systemName: "stop.fill")
-                                .font(.system(size: 7, weight: .bold))
-                                .foregroundStyle(.white)
-                                .frame(width: 14, height: 14)
-                                .background(Circle().fill(Color.red.opacity(0.92)))
+                            OverlayControlCircle(systemName: "stop.fill", tint: .red)
                         }
                         .buttonStyle(.plain)
                         .transition(.opacity)
@@ -620,6 +636,34 @@ struct WingedRecordingView: View {
 }
 
 // MARK: - Waveform Views
+
+/// Small circular control used in the overlay wings (stop / failure). A soft
+/// red disc with a gentle glow so it reads at a glance against the dark glass.
+struct OverlayControlCircle: View {
+    let systemName: String
+    var tint: Color = .red
+
+    var body: some View {
+        Image(systemName: systemName)
+            .font(.system(size: 7, weight: .bold))
+            .foregroundStyle(.white)
+            .frame(width: 15, height: 15)
+            .background(
+                Circle()
+                    .fill(
+                        LinearGradient(
+                            colors: [tint.opacity(1.0), tint.opacity(0.82)],
+                            startPoint: .top,
+                            endPoint: .bottom
+                        )
+                    )
+            )
+            .overlay(
+                Circle().strokeBorder(Color.white.opacity(0.25), lineWidth: 0.5)
+            )
+            .shadow(color: tint.opacity(0.45), radius: 3.5, y: 1)
+    }
+}
 
 struct WaveformBar: View {
     let amplitude: CGFloat
@@ -1041,11 +1085,7 @@ struct RecordingOverlayView: View {
                         Group {
                             if showsStopButton {
                                 Button(action: onStopButtonPressed) {
-                                    Image(systemName: "stop.fill")
-                                        .font(.system(size: 7, weight: .bold))
-                                        .foregroundStyle(.white)
-                                        .frame(width: 14, height: 14)
-                                        .background(Circle().fill(Color.red.opacity(0.92)))
+                                    OverlayControlCircle(systemName: "stop.fill", tint: .red)
                                 }
                                 .buttonStyle(.plain)
                                 .transition(.move(edge: .trailing).combined(with: .opacity))

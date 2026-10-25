@@ -23,6 +23,13 @@ private let uploadLog = OSLog(subsystem: "com.inhaq.fluent", category: "Upload")
 /// dedicated producer thread writes into the bound `outputStream` whenever
 /// space is available. Only one ``chunkSize`` slice is resident at a time.
 ///
+/// File progress is tracked by byte count rather than by EOF detection:
+/// `FileHandle.read(upToCount:)` throws (rather than returning an empty
+/// `Data`) at end-of-file on current macOS, so an EOF-driven state machine
+/// truncated every upload right before its closing boundary. Knowing the file
+/// size up front makes termination deterministic and turns a short read into a
+/// detectable failure instead of a silently wrong `Content-Length`.
+///
 /// The owner must keep a strong reference to the instance for the lifetime of
 /// the upload (the producer thread holds a weak reference to `self`).
 final class StreamingMultipartBody: NSObject, StreamDelegate {
@@ -44,6 +51,10 @@ final class StreamingMultipartBody: NSObject, StreamDelegate {
     private var pendingOffset = 0
     private var fileHandle: FileHandle?
     private var thread: Thread?
+    /// Bytes of the audio file still to be streamed. Set from the file's size
+    /// in `init`; drives the file->suffix transition so EOF handling (where
+    /// `FileHandle.read` throws) never participates in normal completion.
+    private var fileBytesRemaining: Int
 
     /// Guards `isFinished` so shutdown can be requested safely from any thread.
     private let lock = NSLock()
@@ -80,6 +91,7 @@ final class StreamingMultipartBody: NSObject, StreamDelegate {
         self.fileURL = fileURL
         self.chunkSize = chunkSize
         self.fileHandle = handle
+        self.fileBytesRemaining = fileSize
         self.contentLength = prefix.count + fileSize + suffix.count
         super.init()
     }
@@ -110,7 +122,8 @@ final class StreamingMultipartBody: NSObject, StreamDelegate {
         case .hasSpaceAvailable:
             pump()
         case .errorOccurred:
-            os_log(.error, log: uploadLog, "streaming body output error: %{public}@",
+            os_log(.error, log: uploadLog,
+                   "streaming body output error: %{public}@",
                    aStream.streamError?.localizedDescription ?? "unknown")
             finish()
         case .endEncountered:
@@ -165,20 +178,44 @@ final class StreamingMultipartBody: NSObject, StreamDelegate {
             stage = .file
             return prefix
         case .file:
-            // The file handle is opened in `init`; if a read fails partway
-            // through we tear the stream down rather than skipping to the
-            // closing boundary and sending a truncated body.
-            if let handle = fileHandle {
-                if let chunk = try? handle.read(upToCount: chunkSize) {
-                    if !chunk.isEmpty {
-                        return chunk
+            // Byte-counted progression: stream exactly `fileBytesRemaining`
+            // bytes, then hand off to the suffix. Never rely on read-at-EOF —
+            // `FileHandle.read(upToCount:)` throws there on current macOS,
+            // which previously truncated uploads just before the closing
+            // boundary.
+            if fileBytesRemaining > 0, let handle = fileHandle {
+                let wanted = min(chunkSize, fileBytesRemaining)
+                do {
+                    // `read(upToCount:)` is optional-returning and may also
+                    // throw at EOF depending on OS version — with byte-counted
+                    // progression we never legitimately reach EOF, so any
+                    // nil/empty/over-read is an abort, never a completion.
+                    let chunk = try handle.read(upToCount: wanted)
+                    guard let chunk, !chunk.isEmpty, chunk.count <= fileBytesRemaining else {
+                        os_log(.error, log: uploadLog,
+                               "streaming body short or invalid read (%ld bytes left); aborting upload",
+                               fileBytesRemaining)
+                        finish()
+                        return Data()
                     }
-                } else {
+                    fileBytesRemaining -= chunk.count
+                    return chunk
+                } catch {
                     os_log(.error, log: uploadLog,
-                           "streaming body file read failed; aborting upload")
+                           "streaming body file read failed; aborting upload: %{public}@",
+                           error.localizedDescription)
                     finish()
                     return Data()
                 }
+            }
+            if fileBytesRemaining > 0 {
+                // Handle lost without finishing the file — cannot produce a
+                // body matching Content-Length.
+                os_log(.error, log: uploadLog,
+                       "streaming body file handle unavailable with %ld bytes left; aborting upload",
+                       fileBytesRemaining)
+                finish()
+                return Data()
             }
             try? fileHandle?.close()
             fileHandle = nil

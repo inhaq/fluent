@@ -130,6 +130,7 @@ struct SetupView: View {
                                     currentStep = previousStep(currentStep)
                                 }
                             }
+                            .buttonStyle(.fluentGhost)
                             .disabled(isValidatingKey)
                         }
                     }
@@ -196,6 +197,7 @@ struct SetupView: View {
             .background(.regularMaterial)
         }
         .frame(width: 520, height: 680)
+        .background(.regularMaterial)
         .onAppear {
             apiKeyInput = appState.apiKey
             apiBaseURLInput = appState.apiBaseURL
@@ -264,22 +266,32 @@ struct SetupView: View {
     // MARK: - Steps
 
     var welcomeStep: some View {
-        VStack(spacing: 16) {
+        VStack(spacing: 18) {
             Image(nsImage: NSApp.applicationIconImage)
                 .resizable()
-                .aspectRatio(contentMode: .fit)
-                .frame(width: 128, height: 128)
+                .interpolation(.high)
+                .frame(width: 116, height: 116)
+                .clipShape(RoundedRectangle(cornerRadius: 26, style: .continuous))
+                .shadow(color: FluentTheme.accent.opacity(0.30), radius: 22, y: 8)
+                .shadow(color: .black.opacity(0.18), radius: 6, y: 2)
 
-            VStack(spacing: 6) {
+            VStack(spacing: 7) {
                 Text("Welcome to \(AppName.displayName)")
-                    .font(.system(size: 30, weight: .bold, design: .rounded))
+                    .font(.system(size: 29, weight: .bold))
+                    .foregroundStyle(
+                        LinearGradient(
+                            colors: [.primary, .primary.opacity(0.75)],
+                            startPoint: .top,
+                            endPoint: .bottom
+                        )
+                    )
 
                 Text("Dictate text anywhere on your Mac.\nHold to talk or tap to toggle dictation.")
                     .multilineTextAlignment(.center)
+                    .font(.subheadline)
                     .foregroundStyle(.secondary)
                     .fixedSize(horizontal: false, vertical: true)
             }
-
         }
     }
 
@@ -974,13 +986,30 @@ struct SetupView: View {
     }
 
     var stepIndicator: some View {
-        HStack(spacing: 8) {
-            ForEach(totalSteps, id: \.rawValue) { step in
-                Circle()
-                    .fill(step == currentStep ? Color.blue : Color.gray.opacity(0.3))
-                    .frame(width: 8, height: 8)
+        // Continuous progress capsule — quieter and more modern than a row of
+        // dots, and it communicates "how far through the wizard" at a glance.
+        GeometryReader { proxy in
+            ZStack(alignment: .leading) {
+                Capsule(style: .continuous)
+                    .fill(Color.primary.opacity(0.10))
+                Capsule(style: .continuous)
+                    .fill(
+                        LinearGradient(
+                            colors: [FluentTheme.accent, FluentTheme.accent.opacity(0.75)],
+                            startPoint: .leading,
+                            endPoint: .trailing
+                        )
+                    )
+                    .frame(width: max(18, proxy.size.width * progressFraction))
+                    .animation(.spring(response: 0.4, dampingFraction: 0.9), value: currentStep)
             }
         }
+        .frame(width: 180, height: 5)
+    }
+
+    private var progressFraction: CGFloat {
+        let index = totalSteps.firstIndex(of: currentStep) ?? 0
+        return CGFloat(index + 1) / CGFloat(totalSteps.count)
     }
 
     private var canContinueFromCurrentStep: Bool {

@@ -225,6 +225,7 @@ final class AppState: ObservableObject, @unchecked Sendable {
     private let contextScreenshotMaxDimensionStorageKey = "context_screenshot_max_dimension"
     private let captureScreenshotForDictationStorageKey = "capture_screenshot_for_dictation"
     private let prewarmMicrophoneEnabledStorageKey = "prewarm_microphone_enabled"
+    private let skipCleanupForCleanTranscriptsStorageKey = "skip_cleanup_for_clean_transcripts"
     private let shortcutStartDelayStorageKey = "shortcut_start_delay"
     private let preserveClipboardStorageKey = "preserve_clipboard"
     private let keepDictationInClipboardHistoryStorageKey = "keep_dictation_in_clipboard_history"
@@ -242,6 +243,14 @@ final class AppState: ObservableObject, @unchecked Sendable {
     private let pasteAfterShortcutReleaseDelay: TimeInterval = 0.03
     private let pressEnterAfterPasteDelay: TimeInterval = 0.08
     private let clipboardRestoreDelay: TimeInterval = 1.0
+    // Event-driven shortcut-release wait (see performAfterShortcutReleased).
+    // A queue, not a slot: concurrent waits (paste + Enter from overlapping
+    // flows) each keep their action and fire in order on release.
+    private var shortcutReleaseActions: [() -> Void] = []
+    private var shortcutReleaseFallbackTimer: DispatchSourceTimer?
+    private var shortcutReleaseFallbackAttempt = 0
+    private let shortcutReleaseLock = NSLock()
+    private var shortcutReleaseFired = false
     private let fastDictationContextGraceNanoseconds: UInt64 = 150_000_000
     let maxPipelineHistoryCount = 20
     static let defaultContextScreenshotMaxDimension = Int(AppContextService.defaultScreenshotMaxDimension)
@@ -520,6 +529,16 @@ final class AppState: ObservableObject, @unchecked Sendable {
         }
     }
 
+    /// Pastes short, already-clean transcripts directly instead of waiting on
+    /// a post-processing round trip that would return them unchanged (see
+    /// ``PostProcessingService/transcriptIsAlreadyClean(_:context:customVocabulary:customSystemPrompt:outputLanguage:)``).
+    /// On by default.
+    @Published var skipCleanupForCleanTranscripts: Bool {
+        didSet {
+            UserDefaults.standard.set(skipCleanupForCleanTranscripts, forKey: skipCleanupForCleanTranscriptsStorageKey)
+        }
+    }
+
     @Published var customSystemPromptLastModified: String {
         didSet {
             UserDefaults.standard.set(customSystemPromptLastModified, forKey: customSystemPromptLastModifiedStorageKey)
@@ -769,6 +788,7 @@ final class AppState: ObservableObject, @unchecked Sendable {
         let contextScreenshotMaxDimension = Self.normalizedContextScreenshotMaxDimension(storedContextScreenshotMaxDimension)
         let captureScreenshotForDictation = UserDefaults.standard.bool(forKey: captureScreenshotForDictationStorageKey)
         let prewarmMicrophoneEnabled = UserDefaults.standard.bool(forKey: prewarmMicrophoneEnabledStorageKey)
+        let skipCleanupForCleanTranscripts = UserDefaults.standard.object(forKey: skipCleanupForCleanTranscriptsStorageKey) as? Bool ?? true
         let shortcutStartDelay = max(0, UserDefaults.standard.double(forKey: shortcutStartDelayStorageKey))
         let isCommandModeEnabled = UserDefaults.standard.object(forKey: commandModeEnabledStorageKey) == nil
             ? false
@@ -847,6 +867,7 @@ final class AppState: ObservableObject, @unchecked Sendable {
         self.contextScreenshotMaxDimension = contextScreenshotMaxDimension
         self.captureScreenshotForDictation = captureScreenshotForDictation
         self.prewarmMicrophoneEnabled = prewarmMicrophoneEnabled
+        self.skipCleanupForCleanTranscripts = skipCleanupForCleanTranscripts
         self.customSystemPromptLastModified = customSystemPromptLastModified
         self.customContextPromptLastModified = customContextPromptLastModified
         self.outputLanguage = outputLanguage
@@ -2183,6 +2204,7 @@ final class AppState: ObservableObject, @unchecked Sendable {
         activeRecordingTriggerMode = nil
         audioRecorder.onRecordingReady = nil
         audioRecorder.onRecordingFailure = nil
+        audioRecorder.onSessionPrepared = nil
         audioLevelCancellable?.cancel()
         audioLevelCancellable = nil
         cancelRecordingInitializationTimer()
@@ -2539,6 +2561,7 @@ final class AppState: ObservableObject, @unchecked Sendable {
         cancelRecordingInitializationTimer()
         audioRecorder.onRecordingReady = nil
         audioRecorder.onRecordingFailure = nil
+        audioRecorder.onSessionPrepared = nil
         audioLevelCancellable?.cancel()
         audioLevelCancellable = nil
         overlayManager.dismiss()
@@ -2591,6 +2614,17 @@ final class AppState: ObservableObject, @unchecked Sendable {
         audioRecorder.prewarm(deviceUID: selectedMicrophoneID)
     }
 
+    /// Opens the provider connections while the user is still speaking, so
+    /// the upload and post-processing requests after release skip the
+    /// DNS+TCP+TLS handshake. Same-host URLs collapse into one prewarm.
+    private func prewarmProviderConnections() {
+        LLMAPITransport.prewarmConnection(
+            baseURL: resolvedTranscriptionBaseURL,
+            apiKey: resolvedTranscriptionAPIKey
+        )
+        LLMAPITransport.prewarmConnection(baseURL: apiBaseURL, apiKey: apiKey)
+    }
+
     private func beginRecording(triggerMode: RecordingTriggerMode) {
         os_log(.info, log: recordingLog, "beginRecording() entered")
         beginDictationSignpost(triggerMode)
@@ -2614,6 +2648,11 @@ final class AppState: ObservableObject, @unchecked Sendable {
 
         // Transition to waveform when first real audio arrives (any non-zero RMS)
         let deviceUID = selectedMicrophoneID
+        audioRecorder.onSessionPrepared = { [weak self] reusedExistingSession in
+            DispatchQueue.main.async {
+                self?.markDictationSignpost(reusedExistingSession ? "session reused" : "session rebuilt")
+            }
+        }
         audioRecorder.onRecordingReady = { [weak self] in
             DispatchQueue.main.async {
                 guard let self else { return }
@@ -2638,6 +2677,7 @@ final class AppState: ObservableObject, @unchecked Sendable {
         }
 
         startRealtimeStreamingIfEnabled()
+        prewarmProviderConnections()
 
         // Start engine on background thread so UI isn't blocked
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
@@ -2670,6 +2710,7 @@ final class AppState: ObservableObject, @unchecked Sendable {
         endDictationSignpost("failure")
         audioRecorder.onRecordingReady = nil
         audioRecorder.onRecordingFailure = nil
+        audioRecorder.onSessionPrepared = nil
         audioLevelCancellable?.cancel()
         audioLevelCancellable = nil
         contextCaptureTask?.cancel()
@@ -2872,6 +2913,7 @@ final class AppState: ObservableObject, @unchecked Sendable {
         case skippedEmptyRawTranscript
         case voiceMacro(command: String)
         case postProcessingSucceeded
+        case postProcessingSkippedCleanTranscript
         case postProcessingFailedFallback
         case commandModeSucceeded(invocation: CommandInvocation)
         case commandModeFailedFallback(invocation: CommandInvocation)
@@ -2884,6 +2926,8 @@ final class AppState: ObservableObject, @unchecked Sendable {
                 return "Voice macro used: \(command)"
             case .postProcessingSucceeded:
                 return isRetry ? "Post-processing succeeded (retried)" : "Post-processing succeeded"
+            case .postProcessingSkippedCleanTranscript:
+                return "Post-processing skipped (transcript already clean)"
             case .postProcessingFailedFallback:
                 return isRetry
                     ? "Post-processing failed on retry, using raw transcript"
@@ -2931,7 +2975,17 @@ final class AppState: ObservableObject, @unchecked Sendable {
             os_log(.info, log: recordingLog, "Voice macro triggered: %{public}@", macro.command)
             return (macro.payload, .voiceMacro(command: macro.command), "")
         }
-        
+
+        if skipCleanupForCleanTranscripts && PostProcessingService.transcriptIsAlreadyClean(
+            trimmedRawTranscript,
+            context: context,
+            customVocabulary: customVocabulary,
+            customSystemPrompt: customSystemPrompt,
+            outputLanguage: outputLanguage
+        ) {
+            return (trimmedRawTranscript, .postProcessingSkippedCleanTranscript, "")
+        }
+
         do {
             let result = try await postProcessingService.postProcess(
                 transcript: trimmedRawTranscript,
@@ -2952,14 +3006,14 @@ final class AppState: ObservableObject, @unchecked Sendable {
     /// gets a transcript. Runs the realtime commit and file upload in that
     /// strict order to avoid paying for both when realtime succeeds.
     /// Queue for audio enhancement. Kept off the Swift cooperative pool because
-    /// `enhancedWAV` performs blocking file I/O and a long CPU pass with no
-    /// suspension point.
+    /// `enhancedAudioForUpload` performs blocking file I/O and a long CPU pass
+    /// with no suspension point.
     private static let audioEnhancementQueue = DispatchQueue(
         label: "com.inhaq.fluent.audio.enhance",
         qos: .userInitiated
     )
 
-    /// Runs `AudioRecorder.enhancedWAV` off the cooperative pool while staying
+    /// Runs `AudioRecorder.enhancedAudioForUpload` off the cooperative pool while staying
     /// structured, so the calling task awaits it rather than orphaning it.
     ///
     /// The work is wrapped in ``AudioRecorder/withRecordingFileRetained(_:)``
@@ -2967,14 +3021,24 @@ final class AppState: ObservableObject, @unchecked Sendable {
     /// the very file being read. Cancellation checks around this call are not
     /// sufficient on their own — they cannot cover the interval *during* the
     /// read — so the recorder defers the deletion until the read releases it.
-    private static func enhancedWAVOffCooperativePool(
+    private static func enhancedAudioOffCooperativePool(
         at fileURL: URL,
-        recorder: AudioRecorder
+        recorder: AudioRecorder,
+        compress: Bool
     ) async -> URL? {
-        await withCheckedContinuation { continuation in
+        // Whether capture-time filtering actually ran for THIS recording. Any
+        // bypass (copy allocation failure, missing channel data) marks it
+        // false, and the whole-file Stage 1 pass then compensates — a fallback
+        // recording must never be uploaded unfiltered.
+        let highPassApplied = recorder.lastRecordingHighPassApplied
+        return await withCheckedContinuation { continuation in
             audioEnhancementQueue.async {
                 let result = recorder.withRecordingFileRetained {
-                    AudioRecorder.enhancedWAV(at: fileURL)
+                    AudioRecorder.enhancedAudioForUpload(
+                        at: fileURL,
+                        highPassAppliedDuringCapture: highPassApplied,
+                        compress: compress
+                    )
                 }
                 continuation.resume(returning: result)
             }
@@ -2985,7 +3049,8 @@ final class AppState: ObservableObject, @unchecked Sendable {
         realtimeService: RealtimeTranscriptionService?,
         fileService: TranscriptionService,
         fileURL: URL,
-        recorder: AudioRecorder
+        recorder: AudioRecorder,
+        mark: @escaping (StaticString) -> Void
     ) async throws -> String {
         // Enhance the recording before upload (high-pass to lift SNR of quiet
         // speech, then loudness-normalize) so faint dictation reaches Whisper
@@ -3005,15 +3070,24 @@ final class AppState: ObservableObject, @unchecked Sendable {
             // the file is gone and the retain above cannot bring it back.
             try Task.checkCancellation()
 
-            // enhancedWAV reads the whole recording off disk and runs a filter
-            // pass over it — blocking I/O plus CPU with no suspension point — so
-            // it must not run on a cooperative pool thread. It goes to a
-            // dedicated queue rather than Task.detached: a detached task does
-            // not inherit cancellation, so it would keep reading a file the
-            // cancel path has already removed, outliving the session that
-            // started it. Suspending on a continuation keeps the work
-            // structured — this task does not complete until enhancement does.
-            let enhancedURL = await Self.enhancedWAVOffCooperativePool(at: fileURL, recorder: recorder)
+            // Enhancement reads the whole recording off disk and runs a
+            // normalization pass over it — blocking I/O plus CPU with no
+            // suspension point — so it must not run on a cooperative pool
+            // thread. It goes to a dedicated queue rather than Task.detached:
+            // a detached task does not inherit cancellation, so it would keep
+            // reading a file the cancel path has already removed, outliving
+            // the session that started it. Suspending on a continuation keeps
+            // the work structured — this task does not complete until
+            // enhancement does. (The 80 Hz high-pass itself now happens
+            // incrementally during capture; what remains is measure + gain +
+            // rewrite.)
+            mark("enhancement start")
+            let enhancedURL = await Self.enhancedAudioOffCooperativePool(
+                at: fileURL,
+                recorder: recorder,
+                compress: fileService.prefersCompressedUpload
+            )
+            mark("enhancement end")
 
             // Enhancement can take ~100 ms on a long recording; the session may
             // have been cancelled meanwhile, taking the source file with it.
@@ -3032,17 +3106,23 @@ final class AppState: ObservableObject, @unchecked Sendable {
                     try? FileManager.default.removeItem(at: uploadFileURL)
                 }
             }
-            return try await fileService.transcribe(fileURL: uploadFileURL)
+            mark("upload start")
+            let transcript = try await fileService.transcribe(fileURL: uploadFileURL)
+            mark("upload response")
+            return transcript
         }
 
         if let realtimeService {
             do {
                 try Task.checkCancellation()
-                return try await withTaskCancellationHandler {
+                mark("upload start")
+                let result = try await withTaskCancellationHandler {
                     try await realtimeService.commitAndAwaitFinal()
                 } onCancel: {
                     realtimeService.cancel()
                 }
+                mark("upload response")
+                return result
             } catch is CancellationError {
                 throw CancellationError()
             } catch {
@@ -3063,6 +3143,7 @@ final class AppState: ObservableObject, @unchecked Sendable {
         currentSessionIntent = .dictation
         audioRecorder.onRecordingReady = nil
         audioRecorder.onRecordingFailure = nil
+        audioRecorder.onSessionPrepared = nil
         audioLevelCancellable?.cancel()
         audioLevelCancellable = nil
         debugStatusMessage = "Preparing audio"
@@ -3140,7 +3221,12 @@ final class AppState: ObservableObject, @unchecked Sendable {
                         realtimeService: activeRealtime,
                         fileService: transcriptionService,
                         fileURL: transcriptionFileURL,
-                        recorder: self.audioRecorder
+                        recorder: self.audioRecorder,
+                        mark: { [weak self] name in
+                            DispatchQueue.main.async {
+                                self?.markDictationSignpost(name)
+                            }
+                        }
                     )
                     let rawTranscript = try await transcript
                     let parsedTranscript = Self.parseTranscriptCommands(
@@ -3166,6 +3252,7 @@ final class AppState: ObservableObject, @unchecked Sendable {
                     try Task.checkCancellation()
                     await MainActor.run { [weak self] in
                         self?.markDictationSignpost("transcript received")
+                        self?.markDictationSignpost("post-processing start")
                         self?.debugStatusMessage = "Running post-processing"
                     }
                     let result = await self.processTranscript(
@@ -3177,6 +3264,9 @@ final class AppState: ObservableObject, @unchecked Sendable {
                         customSystemPrompt: self.customSystemPrompt,
                         outputLanguage: self.outputLanguage
                     )
+                    await MainActor.run { [weak self] in
+                        self?.markDictationSignpost("post-processing end")
+                    }
                     try Task.checkCancellation()
 
                     let trimmedRawTranscript = parsedTranscript.transcript
@@ -3948,18 +4038,83 @@ final class AppState: ObservableObject, @unchecked Sendable {
         }
     }
 
-    private func performAfterShortcutReleased(attempt: Int = 0, action: @escaping () -> Void) {
-        let maxAttempts = 24
-        if hotkeyManager.hasPressedShortcutInputs && attempt < maxAttempts {
-            DispatchQueue.main.asyncAfter(deadline: .now() + 0.025) { [weak self] in
-                self?.performAfterShortcutReleased(attempt: attempt + 1, action: action)
+    /// Runs `action` once the shortcut inputs are fully released, plus the
+    /// small settle delay (some apps ignore a ⌘V that lands while keys are
+    /// still logically down).
+    ///
+    /// Event-driven first: HotkeyManager fires ``HotkeyManager/onShortcutInputsReleased``
+    /// from the event tap the instant the held inputs transition to released,
+    /// so paste latency tracks actual key-up instead of the next poll tick.
+    /// A 25 ms polling fallback with the same 600 ms ceiling covers the case
+    /// where no release event ever arrives (tap restarted mid-hold, focus
+    /// stolen while holding) — identical worst-case behavior to before.
+    private func performAfterShortcutReleased(action: @escaping () -> Void) {
+        // Fast path: nothing is held anymore.
+        if !hotkeyManager.hasPressedShortcutInputs {
+            DispatchQueue.main.asyncAfter(deadline: .now() + pasteAfterShortcutReleaseDelay) {
+                action()
             }
             return
         }
 
-        DispatchQueue.main.asyncAfter(deadline: .now() + pasteAfterShortcutReleaseDelay) {
-            action()
+        // Re-arm the wait: clear the fired latch from any previous dictation
+        // BEFORE queueing the new action, so the release event can't be
+        // swallowed by a stale latch. Order matters — the latch must be false
+        // by the time the handler is installed below.
+        shortcutReleaseLock.withLock {
+            shortcutReleaseFired = false
+            shortcutReleaseActions.append(action)
         }
+
+        hotkeyManager.onShortcutInputsReleased = { [weak self] in
+            // Event-tap thread — hop to main. Idempotent: the pending slot is
+            // cleared under lock before scheduling.
+            DispatchQueue.main.async {
+                self?.firePendingShortcutReleaseAction()
+            }
+        }
+
+        // Bounded polling fallback (25 ms ticks, 600 ms ceiling).
+        shortcutReleaseFallbackAttempt = 0
+        scheduleShortcutReleaseFallbackPoll()
+    }
+
+    private func firePendingShortcutReleaseAction() {
+        let fired = shortcutReleaseLock.withLock { () -> [() -> Void]? in
+            guard !shortcutReleaseFired else { return nil }
+            shortcutReleaseFired = true
+            let actions = shortcutReleaseActions
+            shortcutReleaseActions.removeAll()
+            return actions
+        }
+        guard let actions = fired, !actions.isEmpty else { return }
+        hotkeyManager.onShortcutInputsReleased = nil
+        shortcutReleaseFallbackTimer?.cancel()
+        shortcutReleaseFallbackTimer = nil
+        // Fire in queue order, each after the settle delay, preserving the
+        // paste -> completion sequencing callers rely on.
+        DispatchQueue.main.asyncAfter(deadline: .now() + pasteAfterShortcutReleaseDelay) {
+            for action in actions {
+                action()
+            }
+        }
+    }
+
+    private func scheduleShortcutReleaseFallbackPoll() {
+        shortcutReleaseFallbackTimer?.cancel()
+        let timer = DispatchSource.makeTimerSource(queue: .main)
+        timer.schedule(deadline: .now() + 0.025)
+        timer.setEventHandler { [weak self] in
+            guard let self else { return }
+            let exhausted = self.shortcutReleaseFallbackAttempt >= 24
+            if self.hotkeyManager.hasPressedShortcutInputs && !exhausted {
+                self.shortcutReleaseFallbackAttempt += 1
+                return
+            }
+            self.firePendingShortcutReleaseAction()
+        }
+        timer.resume()
+        shortcutReleaseFallbackTimer = timer
     }
 
     private func pasteAtCursorWhenShortcutReleased(completion: (() -> Void)? = nil) {

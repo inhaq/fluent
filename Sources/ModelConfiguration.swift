@@ -8,6 +8,10 @@ public struct ModelConfig {
 }
 
 public struct ModelConfiguration {
+    /// Built-in defaults shown until ``ModelCatalog`` has fetched the live
+    /// list from the provider's `/models` endpoint (first launch, no key yet,
+    /// or offline). New provider models appear automatically; this list does
+    /// not need updating for them.
     public static let llmModels = [
         "llama-3.3-70b-versatile",
         "llama-3.1-8b-instant",

@@ -7,23 +7,36 @@ import ServiceManagement
 private struct SettingsCard<Content: View>: View {
     let title: String
     let icon: String
+    var tint: Color = FluentTheme.accent
+    var footer: String? = nil
     let content: Content
 
-    init(_ title: String, icon: String, @ViewBuilder content: () -> Content) {
+    init(_ title: String, icon: String, tint: Color = FluentTheme.accent, footer: String? = nil, @ViewBuilder content: () -> Content) {
         self.title = title
         self.icon = icon
+        self.tint = tint
+        self.footer = footer
         self.content = content()
     }
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 12) {
-            Label(title, systemImage: icon)
-                .font(.headline)
+        VStack(alignment: .leading, spacing: 14) {
+            HStack(spacing: 10) {
+                IconChip(systemImage: icon, tint: tint, size: 26, iconSize: 12)
+                Text(title)
+                    .font(.headline)
+            }
             content
+            if let footer {
+                Text(footer)
+                    .font(.caption)
+                    .foregroundStyle(.tertiary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
         }
-        .padding(18)
+        .padding(20)
         .frame(maxWidth: .infinity, alignment: .leading)
-        .liquidSurface(cornerRadius: 14)
+        .liquidSurface(cornerRadius: FluentTheme.Radius.card)
     }
 }
 
@@ -51,8 +64,36 @@ struct ProviderSettingsFields: View {
     @State private var postProcessingModelDraft: String = ""
     @State private var postProcessingFallbackModelDraft: String = ""
     @State private var contextModelDraft: String = ""
+    @ObservedObject private var modelCatalog = ModelCatalog.shared
 
     let showsModelDescription: Bool
+
+    private var resolvedTranscriptionBaseURL: String {
+        let trimmed = appState.transcriptionAPIURL.trimmingCharacters(in: .whitespacesAndNewlines)
+        return trimmed.isEmpty ? appState.apiBaseURL : trimmed
+    }
+
+    private var resolvedTranscriptionAPIKey: String {
+        let trimmed = appState.transcriptionAPIKey.trimmingCharacters(in: .whitespacesAndNewlines)
+        return trimmed.isEmpty ? appState.apiKey : trimmed
+    }
+
+    /// Changes whenever the provider endpoints or keys change, so the model
+    /// lists are refetched for the new provider.
+    private var modelCatalogKey: String {
+        [appState.apiBaseURL, appState.apiKey, resolvedTranscriptionBaseURL, resolvedTranscriptionAPIKey]
+            .joined(separator: "\u{1F}")
+    }
+
+    private func refreshModelCatalog(force: Bool) async {
+        await modelCatalog.refresh(
+            baseURL: appState.apiBaseURL,
+            apiKey: appState.apiKey,
+            transcriptionBaseURL: resolvedTranscriptionBaseURL,
+            transcriptionAPIKey: resolvedTranscriptionAPIKey,
+            force: force
+        )
+    }
 
     private func commitAPIBaseURL() {
         let trimmed = apiBaseURLInput.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -141,15 +182,17 @@ struct ProviderSettingsFields: View {
             }
 
             if showsModelDescription {
-                Text("If you use another provider, enter that provider's model IDs here.")
+                Text("Models are loaded from your provider's /models endpoint. Choose Custom... to enter a model ID that isn't listed.")
                     .font(.caption)
                     .foregroundStyle(.secondary)
             }
 
+            modelCatalogStatusRow
+
             ModelDropdownView(
                 title: "Post-Processing Model",
                 subtitle: "Used for transcript cleanup and Edit Mode transforms.",
-                predefinedModels: ModelConfiguration.llmModels,
+                predefinedModels: modelCatalog.llmModels(baseURL: appState.apiBaseURL),
                 defaultModel: AppState.defaultPostProcessingModel,
                 textDraft: $postProcessingModelDraft,
                 onCommit: commitPostProcessingModel,
@@ -162,7 +205,7 @@ struct ProviderSettingsFields: View {
             ModelDropdownView(
                 title: "Post-Processing Fallback Model",
                 subtitle: "Used as the explicit retry model for transcript cleanup and Edit Mode transforms.",
-                predefinedModels: ModelConfiguration.llmModels,
+                predefinedModels: modelCatalog.llmModels(baseURL: appState.apiBaseURL),
                 defaultModel: AppState.defaultPostProcessingFallbackModel,
                 textDraft: $postProcessingFallbackModelDraft,
                 onCommit: commitPostProcessingFallbackModel,
@@ -175,7 +218,7 @@ struct ProviderSettingsFields: View {
             VStack(alignment: .leading, spacing: 6) {
                 Text("Post-Processing Reasoning")
                     .font(.caption.weight(.semibold))
-                Text("Controls how much the cleanup model \"thinks\" before answering. Set to Off to disable reasoning entirely on models that support it (e.g. Groq Qwen3 / gpt-oss) — faster and fewer tokens. Automatic leaves each model's default untouched.")
+                Text("Controls how much the cleanup model \"thinks\" before answering. Set to Off to disable reasoning entirely on models that support it (e.g. Groq Qwen3) — faster and fewer tokens. gpt-oss can't turn reasoning off, so Off uses its lowest level (Low). Automatic leaves each model's default untouched.")
                     .font(.caption)
                     .foregroundStyle(.secondary)
                 Picker("", selection: $appState.postProcessingReasoningEffort) {
@@ -189,10 +232,20 @@ struct ProviderSettingsFields: View {
                 .frame(maxWidth: 360, alignment: .leading)
             }
 
+            VStack(alignment: .leading, spacing: 6) {
+                Toggle(
+                    "Skip cleanup for already-clean dictations",
+                    isOn: $appState.skipCleanupForCleanTranscripts
+                )
+                Text("Short English dictations with no filler, corrections, dictated punctuation, names, or vocabulary near-misses are pasted as transcribed, skipping the cleanup request. Never applies with a custom prompt, output language, screenshot context, or Edit Mode.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+
             ModelDropdownView(
                 title: "Context Model",
                 subtitle: "Used for context inference, with a text-only retry when screenshot analysis fails.",
-                predefinedModels: ModelConfiguration.llmModels,
+                predefinedModels: modelCatalog.llmModels(baseURL: appState.apiBaseURL),
                 defaultModel: AppState.defaultContextModel,
                 textDraft: $contextModelDraft,
                 onCommit: commitContextModel,
@@ -205,7 +258,7 @@ struct ProviderSettingsFields: View {
             ModelDropdownView(
                 title: "Transcription Model",
                 subtitle: "Used for speech-to-text transcription.",
-                predefinedModels: ModelConfiguration.transcriptionModels,
+                predefinedModels: modelCatalog.transcriptionModels(baseURL: resolvedTranscriptionBaseURL),
                 defaultModel: AppState.defaultTranscriptionModel,
                 textDraft: $transcriptionModelDraft,
                 onCommit: commitTranscriptionModel,
@@ -352,6 +405,42 @@ struct ProviderSettingsFields: View {
                 contextModelDraft = value
             }
         }
+        .task(id: modelCatalogKey) {
+            // Debounce: the key changes on every keystroke while editing the
+            // API key or URL; only fetch once the user pauses.
+            try? await Task.sleep(nanoseconds: 600_000_000)
+            guard !Task.isCancelled else { return }
+            await refreshModelCatalog(force: false)
+        }
+    }
+
+    private var modelCatalogStatusRow: some View {
+        HStack(spacing: 8) {
+            switch modelCatalog.status {
+            case .loading:
+                ProgressView()
+                    .controlSize(.small)
+                Text("Loading models from provider…")
+            case .failed(let message):
+                Image(systemName: "exclamationmark.triangle.fill")
+                    .foregroundStyle(.orange)
+                Text(modelCatalog.hasLiveModels(baseURL: appState.apiBaseURL)
+                     ? "Couldn't refresh models: \(message) Showing the last loaded list."
+                     : "Couldn't load models: \(message) Showing built-in defaults.")
+            case .idle:
+                Text(modelCatalog.hasLiveModels(baseURL: appState.apiBaseURL)
+                     ? "\(modelCatalog.llmModels(baseURL: appState.apiBaseURL).count) models available from your provider."
+                     : "Showing built-in model defaults.")
+            }
+            Spacer(minLength: 0)
+            Button("Refresh Models") {
+                Task { await refreshModelCatalog(force: true) }
+            }
+            .font(.caption)
+            .disabled(modelCatalog.status == .loading)
+        }
+        .font(.caption)
+        .foregroundStyle(.secondary)
     }
 }
 
@@ -362,24 +451,10 @@ struct SettingsView: View {
 
     var body: some View {
         HStack(spacing: 0) {
-            VStack(alignment: .leading, spacing: 2) {
-                ForEach(SettingsTab.visibleCases) { tab in
-                    Button {
-                        appState.selectedSettingsTab = tab
-                    } label: {
-                        SettingsSidebarRow(title: tab.title, icon: tab.icon)
-                            .liquidSelection(isSelected: appState.selectedSettingsTab == tab)
-                    }
-                    .buttonStyle(.plain)
-                }
-
-                Spacer()
-            }
-            .padding(10)
-            .frame(width: 184)
-            .background(.regularMaterial)
+            settingsSidebar
 
             Divider()
+                .opacity(0.6)
 
             LiquidGlassGroup {
                 Group {
@@ -396,31 +471,73 @@ struct SettingsView: View {
                         DebugSettingsView()
                     }
                 }
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+                .background(Color(nsColor: .windowBackgroundColor))
             }
-            .frame(maxWidth: .infinity, maxHeight: .infinity)
         }
+        .background(.regularMaterial)
     }
-}
 
-private struct SettingsSidebarRow: View {
-    let title: String
-    let icon: String
+    /// System-Settings-style sidebar: translucent rail, tinted icon chips,
+    /// filled accent pill for the active tab.
+    private var settingsSidebar: some View {
+        VStack(alignment: .leading, spacing: 2) {
+            // App identity header
+            HStack(spacing: 10) {
+                if let appIcon = NSApp.applicationIconImage {
+                    Image(nsImage: appIcon)
+                        .resizable()
+                        .interpolation(.high)
+                        .frame(width: 30, height: 30)
+                        .clipShape(RoundedRectangle(cornerRadius: 7, style: .continuous))
+                        .shadow(color: .black.opacity(0.18), radius: 2, y: 1)
+                }
+                VStack(alignment: .leading, spacing: 0) {
+                    Text(AppName.displayName)
+                        .font(.headline)
+                    Text("Settings")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+            }
+            .padding(.horizontal, 6)
+            .padding(.bottom, 12)
 
-    var body: some View {
-        HStack(spacing: 8) {
-            Image(systemName: icon)
-                .font(.system(size: 13, weight: .regular))
-                .frame(width: 16, height: 16, alignment: .center)
-                .foregroundStyle(.primary)
+            ForEach(SettingsTab.visibleCases) { tab in
+                Button {
+                    appState.selectedSettingsTab = tab
+                } label: {
+                    HStack(spacing: 9) {
+                        IconChip(
+                            systemImage: tab.icon,
+                            tint: FluentTheme.accent,
+                            size: 22,
+                            iconSize: 11
+                        )
+                        Text(tab.title)
+                            .font(.body.weight(isSelected(tab) ? .semibold : .regular))
+                            .lineLimit(1)
+                        Spacer(minLength: 0)
+                    }
+                    .padding(.vertical, 6)
+                    .padding(.horizontal, 8)
+                    .contentShape(Rectangle())
+                }
+                .buttonStyle(.plain)
+                .liquidSelection(isSelected: isSelected(tab))
+            }
 
-            Text(title)
-                .font(.body)
-                .frame(maxWidth: .infinity, alignment: .leading)
+            Spacer()
         }
-        .frame(height: 16)
-        .frame(maxWidth: .infinity, alignment: .leading)
-        .padding(.vertical, 8)
-        .padding(.horizontal, 10)
+        .padding(.top, 36)
+        .padding(.horizontal, 12)
+        .padding(.bottom, 12)
+        .frame(width: 196)
+        .background(.regularMaterial)
+    }
+
+    private func isSelected(_ tab: SettingsTab) -> Bool {
+        appState.selectedSettingsTab == tab
     }
 }
 
@@ -430,39 +547,34 @@ struct DebugSettingsView: View {
     @EnvironmentObject var appState: AppState
 
     var body: some View {
-        ScrollView {
-            VStack(alignment: .leading, spacing: 16) {
-                Text("Debug")
-                    .font(.largeTitle.bold())
+        SettingsPage("Debug", subtitle: "Developer diagnostics and overlay previews.") {
+            SettingsCard("Overlay", icon: "wrench.and.screwdriver") {
+                VStack(alignment: .leading, spacing: 12) {
+                    Text("Show the recording overlay with simulated audio levels.")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
 
-                SettingsCard("Overlay", icon: "wrench.and.screwdriver") {
-                    VStack(alignment: .leading, spacing: 12) {
-                        Text("Show the recording overlay with simulated audio levels.")
-                            .font(.caption)
-                            .foregroundStyle(.secondary)
-
-                        Button(appState.isDebugOverlayActive ? "Stop Debug Overlay" : "Debug Overlay") {
-                            appState.toggleDebugOverlay()
-                        }
+                    Button(appState.isDebugOverlayActive ? "Stop Debug Overlay" : "Debug Overlay") {
+                        appState.toggleDebugOverlay()
                     }
-                }
-
-                SettingsCard("Update Overlay", icon: "arrow.down.circle") {
-                    VStack(alignment: .leading, spacing: 12) {
-                        Text("Display the update available overlay after dictation finishes.")
-                            .font(.caption)
-                            .foregroundStyle(.secondary)
-
-                        Toggle("Show after dictation", isOn: $appState.debugShowsUpdateReminderAfterDictation)
-
-                        Button("Show Update Overlay Now") {
-                            appState.showDebugUpdateAvailableOverlay()
-                        }
-                    }
+                    .buttonStyle(.fluentGhost)
                 }
             }
-            .padding(24)
-            .frame(maxWidth: .infinity, alignment: .leading)
+
+            SettingsCard("Update Overlay", icon: "arrow.down.circle") {
+                VStack(alignment: .leading, spacing: 12) {
+                    Text("Display the update available overlay after dictation finishes.")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+
+                    Toggle("Show after dictation", isOn: $appState.debugShowsUpdateReminderAfterDictation)
+
+                    Button("Show Update Overlay Now") {
+                        appState.showDebugUpdateAvailableOverlay()
+                    }
+                    .buttonStyle(.fluentGhost)
+                }
+            }
         }
     }
 }
@@ -526,35 +638,37 @@ struct GeneralSettingsView: View {
     }
 
     var body: some View {
-        ScrollView {
-            VStack(spacing: 20) {
-                // App branding header
-                VStack(spacing: 12) {
-                    Image(nsImage: NSApp.applicationIconImage)
-                        .resizable()
-                        .aspectRatio(contentMode: .fit)
-                        .frame(width: 64, height: 64)
+        SettingsPage("General", subtitle: "Core behavior, provider, and hardware setup.") {
+            // App branding hero
+            HStack(spacing: 14) {
+                Image(nsImage: NSApp.applicationIconImage)
+                    .resizable()
+                    .interpolation(.high)
+                    .frame(width: 52, height: 52)
+                    .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
+                    .shadow(color: .black.opacity(0.22), radius: 5, y: 2)
 
+                VStack(alignment: .leading, spacing: 3) {
                     Text(AppName.displayName)
-                        .font(.system(size: 20, weight: .bold, design: .rounded))
-
+                        .font(.title3.weight(.bold))
                     Text("v\(appVersion)")
-                        .font(.caption)
+                        .font(.caption.weight(.medium))
                         .foregroundStyle(.secondary)
                 }
-                .frame(maxWidth: .infinity)
-                .padding(.top, 4)
-                .padding(.bottom, 4)
+                Spacer()
+            }
+            .padding(FluentTheme.Space.l)
+            .liquidSurface(cornerRadius: FluentTheme.Radius.card)
 
-                SettingsCard("App", icon: "power") {
-                    startupSection
-                }
-                SettingsCard("Updates", icon: "arrow.triangle.2.circlepath") {
-                    updatesSection
-                }
-                SettingsCard("API Key", icon: "key.fill") {
-                    apiKeySection
-                }
+            SettingsCard("App", icon: "power") {
+                startupSection
+            }
+            SettingsCard("Updates", icon: "arrow.triangle.2.circlepath") {
+                updatesSection
+            }
+            SettingsCard("API Key", icon: "key.fill") {
+                apiKeySection
+            }
                 SettingsCard("Output Language", icon: "globe") {
                     outputLanguageSection
                 }
@@ -588,8 +702,6 @@ struct GeneralSettingsView: View {
                 SettingsCard("Build", icon: "info.circle.fill") {
                     buildInfoSection
                 }
-            }
-            .padding(24)
         }
         .onAppear {
             apiKeyInput = appState.apiKey
@@ -1354,19 +1466,16 @@ struct PromptsSettingsView: View {
     @State private var contextTestPrompt: String? = nil
 
     var body: some View {
-        ScrollView {
-            VStack(spacing: 20) {
-                SettingsCard("System Prompt", icon: "text.bubble.fill") {
-                    systemPromptSection
-                }
-                SettingsCard("Instruction Guard", icon: "shield.lefthalf.filled") {
-                    instructionGuardSection
-                }
-                SettingsCard("Context Prompt", icon: "eye.fill") {
-                    contextPromptSection
-                }
+        SettingsPage("Prompts", subtitle: "How transcripts are cleaned up and what context the model sees.") {
+            SettingsCard("System Prompt", icon: "text.bubble.fill") {
+                systemPromptSection
             }
-            .padding(24)
+            SettingsCard("Instruction Guard", icon: "shield.lefthalf.filled") {
+                instructionGuardSection
+            }
+            SettingsCard("Context Prompt", icon: "eye.fill") {
+                contextPromptSection
+            }
         }
         .onAppear {
             customSystemPromptInput = appState.customSystemPrompt.isEmpty
@@ -1870,22 +1979,23 @@ struct RunLogView: View {
     var body: some View {
         VStack(spacing: 0) {
             HStack {
-                VStack(alignment: .leading, spacing: 2) {
+                VStack(alignment: .leading, spacing: 3) {
                     Text("Run Log")
-                        .font(.headline)
+                        .font(.title2.weight(.bold))
                     Text("Stored locally. Only the \(appState.maxPipelineHistoryCount) most recent runs are kept.")
-                        .font(.caption)
-                        .foregroundStyle(.tertiary)
+                        .font(.subheadline)
+                        .foregroundStyle(.secondary)
                 }
                 Spacer()
                 Button("Clear History") {
                     appState.clearPipelineHistory()
                 }
+                .buttonStyle(.fluentGhost)
                 .disabled(appState.pipelineHistory.isEmpty)
             }
-            .padding(.horizontal, 24)
-            .padding(.top, 20)
-            .padding(.bottom, 12)
+            .padding(.horizontal, FluentTheme.Space.xxl)
+            .padding(.top, FluentTheme.Space.xl)
+            .padding(.bottom, FluentTheme.Space.m)
 
             Divider()
 
@@ -2571,13 +2681,10 @@ struct VoiceMacrosSettingsView: View {
     @State private var editingMacro: VoiceMacro?
 
     var body: some View {
-        ScrollView {
-            VStack(spacing: 20) {
-                SettingsCard("Voice Macros", icon: "music.mic") {
-                    macrosSection
-                }
+        SettingsPage("Voice Macros", subtitle: "Spoken phrases that expand into saved text.") {
+            SettingsCard("Macros", icon: "music.mic") {
+                macrosSection
             }
-            .padding(24)
         }
         .sheet(isPresented: $showingAddMacro, onDismiss: { editingMacro = nil }) {
             VoiceMacroEditorView(isPresented: $showingAddMacro, macro: $editingMacro)
